@@ -7,7 +7,21 @@ import {
   resolveAdapterExecutionTargetCwd,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
+  describeAdapterExecutionTarget,
+  ensureAdapterExecutionTargetCommandResolvable,
+  readAdapterExecutionTargetHomeDir,
 } from "./execution-target.js";
+
+describe("describeAdapterExecutionTarget — kubernetes kind", () => {
+  it("returns a human-readable description for a kubernetes target", () => {
+    const desc = describeAdapterExecutionTarget({
+      kind: "kubernetes",
+      clusterConnectionId: "c-123",
+    });
+    expect(desc).toContain("kubernetes");
+    expect(desc).toContain("c-123");
+  });
+});
 
 describe("runAdapterExecutionTargetShellCommand", () => {
   afterEach(() => {
@@ -399,5 +413,43 @@ describe("resolveAdapterExecutionTargetCwd", () => {
     expect(resolveAdapterExecutionTargetCwd(null, "", "/Users/host/repo/server")).toBe(
       "/Users/host/repo/server",
     );
+  });
+});
+
+describe("kubernetes kind: runtime helpers explicitly throw M1-not-implemented", () => {
+  const target = { kind: "kubernetes" as const, clusterConnectionId: "c-1" };
+
+  it("resolveAdapterExecutionTargetCwd throws", () => {
+    expect(() => resolveAdapterExecutionTargetCwd(target, null, "/fallback")).toThrow(/not implemented/i);
+  });
+
+  it("ensureAdapterExecutionTargetCommandResolvable throws", async () => {
+    await expect(
+      ensureAdapterExecutionTargetCommandResolvable("node", target, "/cwd", process.env),
+    ).rejects.toThrow(/not implemented/i);
+  });
+
+  it("runAdapterExecutionTargetProcess throws", async () => {
+    await expect(
+      runAdapterExecutionTargetProcess("r-1", target, "node", [], {
+        cwd: "/",
+        env: {},
+        timeoutSec: 1,
+        graceSec: 1,
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow(/not implemented/i);
+  });
+
+  it("runAdapterExecutionTargetShellCommand throws", async () => {
+    await expect(
+      runAdapterExecutionTargetShellCommand("r-1", target, "echo hi", { cwd: "/", env: {} }),
+    ).rejects.toThrow(/not implemented/i);
+  });
+
+  it("readAdapterExecutionTargetHomeDir throws", async () => {
+    await expect(
+      readAdapterExecutionTargetHomeDir("r-1", target, { cwd: "/", env: {} }),
+    ).rejects.toThrow(/not implemented/i);
   });
 });
