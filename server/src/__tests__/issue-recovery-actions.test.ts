@@ -645,7 +645,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
-  it("records false positives without cancelling the source issue", async () => {
+  it("rejects false-positive recovery resolution without an explicit source issue status", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -669,7 +669,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcome: "false_positive",
         resolutionNote: "The source issue still has a live execution path.",
       })
-      .expect(200);
+      .expect(400);
 
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(sourceIssue?.status).toBe("in_progress");
@@ -679,9 +679,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow).toMatchObject({
-      status: "resolved",
-      outcome: "false_positive",
-      resolutionNote: "The source issue still has a live execution path.",
+      status: "active",
+      outcome: null,
+      resolutionNote: null,
     });
   });
 

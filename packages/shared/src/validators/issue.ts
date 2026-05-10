@@ -239,8 +239,6 @@ export const resolveIssueRecoveryActionSchema = z.object({
 
   if (value.outcome === "false_positive" || value.outcome === "cancelled") {
     if (
-      value.sourceIssueStatus !== undefined &&
-      value.sourceIssueStatus !== null &&
       value.sourceIssueStatus !== "done" &&
       value.sourceIssueStatus !== "in_review"
     ) {

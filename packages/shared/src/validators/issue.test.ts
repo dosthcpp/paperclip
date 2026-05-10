@@ -64,6 +64,12 @@ describe("issue validators", () => {
         sourceIssueStatus: "blocked",
       }).success,
     ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "false_positive",
+      }).success,
+    ).toBe(false);
   });
 
   it("allows cancelled recovery resolutions to atomically restore the source issue status", () => {
@@ -81,6 +87,12 @@ describe("issue validators", () => {
       resolveIssueRecoveryActionSchema.safeParse({
         outcome: "cancelled",
         sourceIssueStatus: "blocked",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "cancelled",
       }).success,
     ).toBe(false);
   });

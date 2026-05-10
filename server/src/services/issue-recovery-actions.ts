@@ -13,6 +13,8 @@ const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfi
 const MAX_UPSERT_RETRIES = 3;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTransaction = Db | DbTransaction;
 
 export type UpsertIssueRecoveryActionInput = {
   companyId: string;
@@ -225,7 +227,7 @@ export function issueRecoveryActionService(db: Db) {
 
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
-    dbOrTx: any = db,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction | null> {
     const now = new Date();
     const predicates = [
