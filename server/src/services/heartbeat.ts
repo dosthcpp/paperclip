@@ -336,7 +336,12 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectEnv: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
 }) {
-  const { config: resolvedConfig, secretKeys, manifest } = await input.secretsSvc.resolveAdapterConfigForRuntime(
+  const {
+    config: resolvedConfig,
+    secretKeys,
+    manifest,
+    oauthConnectionIds,
+  } = await input.secretsSvc.resolveAdapterConfigForRuntime(
     input.companyId,
     input.executionRunConfig,
     input.agentId
@@ -379,6 +384,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     resolvedConfig,
     secretKeys,
     secretManifest: [...(manifest ?? []), ...(projectEnvResolution.manifest ?? [])],
+    oauthConnectionIds: oauthConnectionIds ?? [],
   };
 }
 
@@ -7063,7 +7069,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
-    const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
+    const { resolvedConfig, secretKeys, secretManifest, oauthConnectionIds } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
       agentId: agent.id,
       issueId,
@@ -7647,7 +7653,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const adapter = getServerAdapter(agent.adapterType);
       const authToken = adapter.supportsLocalAgentJwt
-        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+        ? createLocalAgentJwt(
+            agent.id,
+            agent.companyId,
+            agent.adapterType,
+            run.id,
+            oauthConnectionIds.length > 0
+              ? { connectionIds: oauthConnectionIds }
+              : undefined,
+          )
         : null;
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
