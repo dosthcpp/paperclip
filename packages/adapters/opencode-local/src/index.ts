@@ -8,9 +8,12 @@ export const label = "OpenCode (local)";
 // (linux-x64, linux-x64-musl, linux-x64-baseline, linux-x64-baseline-musl) in
 // parallel even though only one matches the sandbox; on bandwidth-constrained
 // sandboxes (e.g. Cloudflare) that exceeded the 240s install budget. The
-// official installer fetches a single arch-specific binary and adds
-// `$HOME/.opencode/bin` to PATH via `~/.bashrc`, which sandbox `sh -lc`
-// invocations source.
+// official installer fetches a single arch-specific binary into
+// `$HOME/.opencode/bin` and tries to add it to PATH via `~/.bashrc`. That
+// rc-file path is only sourced by interactive/login shells, so non-login
+// `sh -c` probe invocations (used by the runtime PATH check) cannot find the
+// binary. We fix that by symlinking the installed binary into
+// `$HOME/.local/bin`, which is on the default PATH on every distro we target.
 //
 // Security tradeoff: this is `curl | bash` without a SHA-256 verification of
 // the install script. We accept this because:
@@ -25,7 +28,12 @@ export const label = "OpenCode (local)";
 // shell) and `curl -fsSL` give us fail-fast behavior on HTTP errors. If
 // OpenCode starts publishing a stable checksum/signature, switch to fetching
 // a versioned tarball + verifying the digest before exec.
-export const SANDBOX_INSTALL_COMMAND = "curl -fsSL https://opencode.ai/install | bash";
+export const SANDBOX_INSTALL_COMMAND =
+  'curl -fsSL https://opencode.ai/install | bash && ' +
+  'mkdir -p "$HOME/.local/bin" && ' +
+  'if [ -x "$HOME/.opencode/bin/opencode" ]; then ' +
+  'ln -sf "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode"; ' +
+  'fi';
 
 export const DEFAULT_OPENCODE_LOCAL_MODEL = "openai/gpt-5.2-codex";
 
