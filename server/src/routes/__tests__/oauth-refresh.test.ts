@@ -140,6 +140,17 @@ describe("POST /connections/:id/refresh", () => {
     expect(res.body.errorCode).toBe("connection_revoked");
   });
 
+  it("returns 422 for permanent skipped refresh outcomes", async () => {
+    const { app } = makeApp({
+      refreshOutcome: { outcome: "skipped", reason: "refresh_not_supported" },
+    });
+    const res = await request(app).post(
+      "/api/companies/c1/oauth/connections/conn/refresh",
+    );
+    expect(res.status).toBe(422);
+    expect(res.body.errorCode).toBe("refresh_not_supported");
+  });
+
   it("returns 404 when connection does not belong to company", async () => {
     const { app } = makeApp({ conn: null });
     const res = await request(app).post(

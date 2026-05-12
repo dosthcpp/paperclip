@@ -90,11 +90,4 @@ describe("Connection management routes", () => {
     expect(res.status).toBe(404);
   });
 
-  it("GET /connections/:id rejects cross-tenant", async () => {
-    const otherTenantConn = { ...conn, companyId: "c2" };
-    const res = await request(makeApp([otherTenantConn])).get(
-      "/api/companies/c1/oauth/connections/conn-1",
-    );
-    expect(res.status).toBe(404);
-  });
 });

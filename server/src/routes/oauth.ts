@@ -230,7 +230,7 @@ export function oauthRoutes(deps: OAuthRouteDeps): Router {
         eq(oauthConnections.companyId, companyId),
       ),
     });
-    if (!row || (row as { companyId: string }).companyId !== companyId) {
+    if (!row) {
       res.status(404).end();
       return;
     }
@@ -299,6 +299,17 @@ export function oauthRoutes(deps: OAuthRouteDeps): Router {
     if (result.outcome === "revoked") {
       res.status(409).json({
         errorCode: "connection_revoked",
+        connection: publicConnection(updated),
+      });
+      return;
+    }
+    if (result.outcome === "skipped") {
+      if (result.reason === "not_found") {
+        res.status(404).end();
+        return;
+      }
+      res.status(422).json({
+        errorCode: result.reason,
         connection: publicConnection(updated),
       });
       return;

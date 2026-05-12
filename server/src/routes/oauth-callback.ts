@@ -326,6 +326,10 @@ export function oauthCallbackRoute(deps: OAuthCallbackDeps): RequestHandler {
           back(deps, stateRow.returnUrl, { oauth_error: "account_mismatch" }),
         );
       }
+      // For non-mismatch failures we intentionally leave deterministic
+      // oauth:<provider>:<account> secret rows in place. A retry overwrites
+      // them, and preserving the original error keeps the callback failure
+      // visible instead of hiding it behind best-effort cleanup.
       throw err;
     }
 
