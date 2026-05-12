@@ -62,7 +62,7 @@ function toPosixPath(value: string): string {
   return value.split(path.sep).join("/");
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
   return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }

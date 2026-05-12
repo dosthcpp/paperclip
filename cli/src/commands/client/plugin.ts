@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { Command, Option } from "commander";
 import {
   scaffoldPluginProject,
+  shellQuote,
   type ScaffoldPluginOptions,
 } from "@paperclipai/create-paperclip-plugin";
 import pc from "picocolors";
@@ -167,11 +168,6 @@ function formatPlugin(p: PluginRecord): string {
 
 function packageToDirName(pluginName: string): string {
   return pluginName.replace(/^@[^/]+\//, "");
-}
-
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
 
 export function buildPluginInitScaffoldOptions(
