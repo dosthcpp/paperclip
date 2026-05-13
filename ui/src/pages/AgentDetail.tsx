@@ -42,6 +42,9 @@ import { RunButton, PauseResumeButton } from "../components/AgentActionButtons";
 import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
 import { FileTree, buildFileTree } from "../components/FileTree";
 import { ScrollToBottom } from "../components/ScrollToBottom";
+import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallout";
+import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
+import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { describeRunRetryState } from "../lib/runRetryState";
@@ -2993,6 +2996,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
   const summary = run.resultJson
     ? String((run.resultJson as Record<string, unknown>).summary ?? (run.resultJson as Record<string, unknown>).result ?? "")
     : run.error ?? "";
+  const sourceResolvedFold = readSourceResolvedWatchdogFold(run.resultJson);
 
   return (
     <Link
@@ -3016,6 +3020,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
         )}>
           {sourceLabels[run.invocationSource] ?? run.invocationSource}
         </span>
+        {sourceResolvedFold ? <SourceResolvedFoldBadge showIcon={false} className="shrink-0 text-[10px] py-0" /> : null}
         <span className="ml-auto text-[11px] text-muted-foreground shrink-0">
           {relativeTime(run.createdAt)}
         </span>
@@ -3567,6 +3572,13 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
           <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{run.stdoutExcerpt}</pre>
         </div>
       )}
+
+      {(() => {
+        const fold = readSourceResolvedWatchdogFold(run.resultJson);
+        if (!fold) return null;
+        if (run.status === "failed" || run.status === "timed_out") return null;
+        return <SourceResolvedFoldCallout fold={fold} finalizedAt={run.finishedAt} />;
+      })()}
 
       {/* Log viewer */}
       <LogViewer run={run} adapterType={adapterType} />
