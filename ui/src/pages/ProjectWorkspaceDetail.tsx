@@ -38,21 +38,18 @@ type WorkspaceFormState = {
 
 type ProjectWorkspaceSourceType = ProjectWorkspace["sourceType"];
 type ProjectWorkspaceVisibility = ProjectWorkspace["visibility"];
-type ProjectWorkspaceTab = "configuration" | "changes";
-const WORKSPACE_CHANGES_PLUGIN_TAB = "plugin:paperclip.workspace-diff:workspace-changes-tab";
+type ProjectWorkspaceBaseTab = "configuration";
+type ProjectWorkspacePluginTab = `plugin:${string}`;
+type ProjectWorkspaceTab = ProjectWorkspaceBaseTab | ProjectWorkspacePluginTab;
+
+function isProjectWorkspacePluginTab(value: string | null): value is ProjectWorkspacePluginTab {
+  return typeof value === "string" && value.startsWith("plugin:");
+}
 
 function projectWorkspaceTabFromSearch(search: string): ProjectWorkspaceTab {
   const tab = new URLSearchParams(search).get("tab");
-  if (tab === "changes" || tab === WORKSPACE_CHANGES_PLUGIN_TAB) return "changes";
+  if (isProjectWorkspacePluginTab(tab)) return tab;
   return "configuration";
-}
-
-function upstreamBaseRef(workspace: ProjectWorkspace) {
-  if (workspace.defaultRef) return workspace.defaultRef;
-  if (workspace.repoRef) {
-    return workspace.repoRef.startsWith("origin/") ? workspace.repoRef : `origin/${workspace.repoRef.replace(/^refs\/heads\//, "")}`;
-  }
-  return null;
 }
 
 const SOURCE_TYPE_OPTIONS: Array<{ value: ProjectWorkspaceSourceType; label: string; description: string }> = [
@@ -278,37 +275,14 @@ export function ProjectWorkspaceDetail() {
     companyId: project?.companyId ?? null,
     enabled: Boolean(project?.companyId),
   });
-  const {
-    slots: legacyWorkspacePluginDetailSlots,
-    isLoading: legacyWorkspacePluginDetailSlotsLoading,
-    errorMessage: legacyWorkspacePluginDetailSlotsError,
-  } = usePluginSlots({
-    slotTypes: ["detailTab"],
-    entityType: "execution_workspace",
-    companyId: project?.companyId ?? null,
-    enabled: Boolean(project?.companyId),
-  });
   const pluginTabItems = useMemo(
     () => pluginDetailSlots.map((slot) => ({
-      value: `plugin:${slot.pluginKey}:${slot.id}`,
+      value: `plugin:${slot.pluginKey}:${slot.id}` as ProjectWorkspacePluginTab,
       label: slot.displayName,
       slot,
     })),
     [pluginDetailSlots],
   );
-  const legacyWorkspacePluginTabItems = useMemo(
-    () => legacyWorkspacePluginDetailSlots.map((slot) => ({
-      value: `plugin:${slot.pluginKey}:${slot.id}`,
-      label: slot.displayName,
-      slot,
-    })),
-    [legacyWorkspacePluginDetailSlots],
-  );
-  const changesPluginTab = pluginTabItems.find((item) => item.value === WORKSPACE_CHANGES_PLUGIN_TAB)
-    ?? legacyWorkspacePluginTabItems.find((item) => item.value === WORKSPACE_CHANGES_PLUGIN_TAB)
-    ?? null;
-  const changesPluginTabLoading = pluginDetailSlotsLoading || legacyWorkspacePluginDetailSlotsLoading;
-  const changesPluginTabError = pluginDetailSlotsError ?? legacyWorkspacePluginDetailSlotsError;
 
   useEffect(() => {
     if (!project?.companyId || project.companyId === selectedCompanyId) return;
@@ -427,18 +401,13 @@ export function ProjectWorkspaceDetail() {
   const sourceTypeDescription = SOURCE_TYPE_OPTIONS.find((option) => option.value === form.sourceType)?.description ?? null;
   const handleTabChange = (tab: ProjectWorkspaceTab) => {
     const workspacePath = projectWorkspaceUrl(project, routeWorkspaceId);
-    if (tab === "changes") {
-      const baseRef = upstreamBaseRef(workspace);
-      const params = new URLSearchParams({
-        tab: "changes",
-        diffView: baseRef ? "head" : "working-tree",
-      });
-      if (baseRef) params.set("baseRef", baseRef);
-      navigate(`${workspacePath}?${params.toString()}`);
+    if (isProjectWorkspacePluginTab(tab)) {
+      navigate(`${workspacePath}?tab=${encodeURIComponent(tab)}`);
       return;
     }
     navigate(workspacePath);
   };
+  const activePluginTab = pluginTabItems.find((item) => item.value === activeTab) ?? null;
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -458,7 +427,7 @@ export function ProjectWorkspaceDetail() {
         <PageTabBar
           items={[
             { value: "configuration", label: "Configuration" },
-            { value: "changes", label: "Changes" },
+            ...pluginTabItems.map((item) => ({ value: item.value, label: item.label })),
           ]}
           align="start"
           value={activeTab}
@@ -734,10 +703,10 @@ export function ProjectWorkspaceDetail() {
       </div>
       ) : null}
 
-      {activeTab === "changes" ? (
-        changesPluginTab ? (
+      {isProjectWorkspacePluginTab(activeTab) ? (
+        activePluginTab ? (
           <PluginSlotMount
-            slot={changesPluginTab.slot}
+            slot={activePluginTab.slot}
             context={{
               companyId: project.companyId,
               companyPrefix: companyPrefix ?? null,
@@ -749,11 +718,11 @@ export function ProjectWorkspaceDetail() {
           />
         ) : (
           <div className="rounded-lg border border-dashed border-border bg-background px-4 py-8 text-sm text-muted-foreground">
-            {changesPluginTabError
-              ? `Workspace changes failed to load: ${changesPluginTabError}`
-              : changesPluginTabLoading
-                ? "Loading workspace changes..."
-                : "Workspace changes are not available."}
+            {pluginDetailSlotsError
+              ? pluginDetailSlotsError
+              : pluginDetailSlotsLoading
+                ? "Loading workspace plugin..."
+                : "Workspace plugin tab is not available."}
           </div>
         )
       ) : null}

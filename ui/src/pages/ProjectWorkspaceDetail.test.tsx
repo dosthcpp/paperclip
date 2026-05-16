@@ -20,6 +20,11 @@ const mockSetSelectedCompanyId = vi.hoisted(() => vi.fn());
 const mockUsePluginSlots = vi.hoisted(() => vi.fn());
 const mockPluginSlotMount = vi.hoisted(() => vi.fn());
 const mockRouteSearch = vi.hoisted(() => ({ value: "" }));
+const mockPluginSlotState = vi.hoisted(() => ({
+  slots: [] as unknown[],
+  isLoading: false,
+  errorMessage: null as string | null,
+}));
 
 vi.mock("../api/projects", () => ({ projectsApi: mockProjectsApi }));
 
@@ -57,23 +62,9 @@ vi.mock("@/plugins/slots", () => ({
     mockUsePluginSlots(filters);
     const entityType = (filters as { entityType?: string }).entityType;
     return {
-      slots: entityType === "execution_workspace"
-        ? [
-          {
-            id: "workspace-changes-tab",
-            type: "detailTab",
-            displayName: "Changes",
-            exportName: "WorkspaceChangesTab",
-            entityTypes: ["execution_workspace"],
-            pluginId: "plugin-1",
-            pluginKey: "paperclip.workspace-diff",
-            pluginDisplayName: "Workspace Diff",
-            pluginVersion: "0.1.0",
-          },
-        ]
-        : [],
-      isLoading: false,
-      errorMessage: null,
+      slots: entityType === "project_workspace" ? mockPluginSlotState.slots : [],
+      isLoading: mockPluginSlotState.isLoading,
+      errorMessage: mockPluginSlotState.errorMessage,
     };
   },
 }));
@@ -174,7 +165,22 @@ async function flush() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-describe("ProjectWorkspaceDetail changes tab", () => {
+function pluginSlot(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "quality-tab",
+    type: "detailTab",
+    displayName: "Quality",
+    exportName: "ProjectWorkspaceQualityTab",
+    entityTypes: ["project_workspace"],
+    pluginId: "plugin-1",
+    pluginKey: "paperclip.quality",
+    pluginDisplayName: "Quality Plugin",
+    pluginVersion: "0.1.0",
+    ...overrides,
+  };
+}
+
+describe("ProjectWorkspaceDetail plugin tabs", () => {
   let root: Root | null = null;
   let container: HTMLDivElement;
 
@@ -182,6 +188,9 @@ describe("ProjectWorkspaceDetail changes tab", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     mockProjectsApi.get.mockResolvedValue(project());
+    mockPluginSlotState.slots = [];
+    mockPluginSlotState.isLoading = false;
+    mockPluginSlotState.errorMessage = null;
   });
 
   afterEach(() => {
@@ -207,50 +216,83 @@ describe("ProjectWorkspaceDetail changes tab", () => {
     });
   }
 
-  it("shows Changes as a first-class tab and maps the legacy plugin tab URL to it", async () => {
-    mockRouteSearch.value =
-      "?tab=plugin%3Apaperclip.workspace-diff%3Aworkspace-changes-tab&diffView=head&baseRef=origin%2Fmaster";
+  it("scopes plugin detail-tab discovery to project_workspace and the project's company", async () => {
+    await render();
+
+    const enabledDetailTabFilters = mockUsePluginSlots.mock.calls
+      .map(([filters]) => filters as { slotTypes: string[]; entityType: string; companyId: string | null; enabled?: boolean })
+      .filter((filters) => filters.slotTypes.includes("detailTab") && filters.enabled !== false);
+
+    expect(enabledDetailTabFilters.length).toBeGreaterThan(0);
+    for (const filters of enabledDetailTabFilters) {
+      expect(filters.entityType).toBe("project_workspace");
+      expect(filters.companyId).toBe("company-1");
+    }
+  });
+
+  it("renders an arbitrary project_workspace plugin detail tab from the generic URL value", async () => {
+    mockPluginSlotState.slots = [pluginSlot()];
+    mockRouteSearch.value = "?tab=plugin%3Apaperclip.quality%3Aquality-tab&diffView=head&baseRef=origin%2Fmaster";
 
     await render();
 
     expect(container.querySelector('[data-tab-value="configuration"]')?.textContent).toBe("Configuration");
-    expect(container.querySelector('[data-tab-value="changes"]')?.textContent).toBe("Changes");
+    expect(container.querySelector('[data-tab-value="plugin:paperclip.quality:quality-tab"]')?.textContent).toBe("Quality");
+    expect(container.querySelector('[data-tab-value="changes"]')).toBeNull();
     expect(container.querySelector('[data-testid="plugin-slot-mount"]')).not.toBeNull();
     expect(mockPluginSlotMount).toHaveBeenCalledWith(
       expect.objectContaining({
-        slot: expect.objectContaining({ pluginKey: "paperclip.workspace-diff", id: "workspace-changes-tab" }),
+        slot: expect.objectContaining({ pluginKey: "paperclip.quality", id: "quality-tab" }),
         context: expect.objectContaining({ entityType: "project_workspace", entityId: "workspace-1" }),
       }),
     );
   });
 
-  it("opens the Changes tab in upstream comparison mode", async () => {
+  it("navigates plugin tabs with only the generic plugin tab parameter", async () => {
+    mockPluginSlotState.slots = [pluginSlot()];
+
     await render();
 
     await act(async () => {
-      (container.querySelector('[data-tab-value="changes"]') as HTMLButtonElement).click();
+      (container.querySelector('[data-tab-value="plugin:paperclip.quality:quality-tab"]') as HTMLButtonElement).click();
     });
 
     expect(mockNavigate).toHaveBeenCalledWith(
-      "/projects/paperclip-app/workspaces/workspace-1?tab=changes&diffView=head&baseRef=origin%2Fmain",
+      "/projects/paperclip-app/workspaces/workspace-1?tab=plugin%3Apaperclip.quality%3Aquality-tab",
     );
+    expect(mockNavigate).not.toHaveBeenCalledWith(expect.stringContaining("diffView"));
+    expect(mockNavigate).not.toHaveBeenCalledWith(expect.stringContaining("baseRef"));
   });
 
-  it("opens the Changes tab in working-tree mode when no upstream ref is known", async () => {
-    const workspaceWithoutRef = projectWorkspace({ defaultRef: null, repoRef: null });
-    mockProjectsApi.get.mockResolvedValue(project({
-      workspaces: [workspaceWithoutRef],
-      primaryWorkspace: workspaceWithoutRef,
-    }));
+  it("does not treat the old changes tab query as a core plugin tab", async () => {
+    mockPluginSlotState.slots = [pluginSlot()];
+    mockRouteSearch.value = "?tab=changes&diffView=head&baseRef=origin%2Fmain";
 
     await render();
 
-    await act(async () => {
-      (container.querySelector('[data-tab-value="changes"]') as HTMLButtonElement).click();
-    });
+    expect(container.querySelector('[data-tab-value="changes"]')).toBeNull();
+    expect(container.querySelector('[data-testid="plugin-slot-mount"]')).toBeNull();
+    expect(container.textContent).toContain("Project workspace");
+  });
 
-    expect(mockNavigate).toHaveBeenCalledWith(
-      "/projects/paperclip-app/workspaces/workspace-1?tab=changes&diffView=working-tree",
-    );
+  it("shows loading and error states for plugin tab manifests", async () => {
+    mockPluginSlotState.isLoading = true;
+    mockRouteSearch.value = "?tab=plugin%3Apaperclip.quality%3Aquality-tab";
+
+    await render();
+
+    expect(container.textContent).toContain("Loading workspace plugin...");
+
+    act(() => root?.unmount());
+    root = null;
+    container.innerHTML = "";
+    vi.clearAllMocks();
+    mockProjectsApi.get.mockResolvedValue(project());
+    mockPluginSlotState.isLoading = false;
+    mockPluginSlotState.errorMessage = "Plugin manifest failed";
+
+    await render();
+
+    expect(container.textContent).toContain("Plugin manifest failed");
   });
 });
