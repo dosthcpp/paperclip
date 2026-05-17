@@ -1008,47 +1008,52 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         cleanup,
       },
     };
-    const [finalizedRun] = await db
-      .update(heartbeatRuns)
-      .set({
-        status: finalRunStatus,
-        finishedAt: input.now,
-        error: null,
-        errorCode: null,
-        resultJson,
-        updatedAt: input.now,
-      })
-      .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId), eq(heartbeatRuns.status, "running")))
-      .returning();
-    if (!finalizedRun) return { kind: "skipped" as const };
-
-    if (input.run.wakeupRequestId) {
-      await db
-        .update(agentWakeupRequests)
+    const finalizedRun = await db.transaction(async (tx) => {
+      const [updatedRun] = await tx
+        .update(heartbeatRuns)
         .set({
-          status: finalRunStatus === "succeeded" ? "completed" : "cancelled",
+          status: finalRunStatus,
           finishedAt: input.now,
           error: null,
+          errorCode: null,
+          resultJson,
           updatedAt: input.now,
         })
-        .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
-    }
+        .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId), eq(heartbeatRuns.status, "running")))
+        .returning();
+      if (!updatedRun) return null;
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: input.now,
-      })
-      .where(
-        and(
-          eq(issues.id, input.sourceIssue.id),
-          eq(issues.companyId, input.run.companyId),
-          eq(issues.executionRunId, input.run.id),
-        ),
-      );
+      if (input.run.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: finalRunStatus === "succeeded" ? "completed" : "cancelled",
+            finishedAt: input.now,
+            error: null,
+            updatedAt: input.now,
+          })
+          .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
+      }
+
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(issues.id, input.sourceIssue.id),
+            eq(issues.companyId, input.run.companyId),
+            eq(issues.executionRunId, input.run.id),
+          ),
+        );
+
+      return updatedRun;
+    });
+    if (!finalizedRun) return { kind: "skipped" as const };
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
       await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
