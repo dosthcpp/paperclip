@@ -158,6 +158,20 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   return true;
 }
 
+function shouldSupersedeRequestConfirmationOnUserComment(interaction: RequestConfirmationInteraction) {
+  return interaction.payload.supersedeOnUserComment !== false;
+}
+
+function isCommentAtOrAfterInteraction(args: {
+  commentCreatedAt: Date | string;
+  interactionCreatedAt: Date | string;
+}) {
+  const commentCreatedAtMs = new Date(args.commentCreatedAt).getTime();
+  const interactionCreatedAtMs = new Date(args.interactionCreatedAt).getTime();
+  if (!Number.isFinite(commentCreatedAtMs) || !Number.isFinite(interactionCreatedAtMs)) return false;
+  return commentCreatedAtMs >= interactionCreatedAtMs;
+}
+
 function buildTaskCreationOrder(tasks: ReadonlyArray<SuggestTasksInteraction["payload"]["tasks"][number]>) {
   const taskByClientKey = new Map(tasks.map((task) => [task.clientKey, task] as const));
   const ordered: Array<SuggestTasksInteraction["payload"]["tasks"][number]> = [];
@@ -967,7 +981,7 @@ export function issueThreadInteractionService(db: Db) {
 
     expireRequestConfirmationsSupersededByComment: async (
       issue: { id: string; companyId: string },
-      comment: { id: string; authorUserId?: string | null },
+      comment: { id: string; createdAt: Date | string; authorUserId?: string | null },
       actor: InteractionActor,
     ) => {
       if (!comment.authorUserId) return [];
@@ -984,7 +998,13 @@ export function issueThreadInteractionService(db: Db) {
 
       const superseded = rows.filter((row) => {
         const interaction = hydrateInteraction(row) as RequestConfirmationInteraction;
-        return interaction.payload.supersedeOnUserComment === true;
+        return (
+          shouldSupersedeRequestConfirmationOnUserComment(interaction)
+          && isCommentAtOrAfterInteraction({
+            commentCreatedAt: comment.createdAt,
+            interactionCreatedAt: row.createdAt,
+          })
+        );
       });
 
       if (superseded.length === 0) return [];
@@ -1003,6 +1023,72 @@ export function issueThreadInteractionService(db: Db) {
             },
             resolvedByAgentId: actor.agentId ?? null,
             resolvedByUserId: actor.userId ?? null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) expired.push(hydrateInteraction(updated));
+      }
+
+      if (expired.length > 0) {
+        await touchIssue(db, issue.id);
+      }
+      return expired;
+    },
+
+    expireRequestConfirmationsSupersededByHistoricalComments: async (
+      issue: { id: string; companyId: string },
+    ) => {
+      const [rows, comments] = await Promise.all([
+        db
+          .select()
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.kind, "request_confirmation"),
+            eq(issueThreadInteractions.status, "pending"),
+          )),
+        db
+          .select()
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.companyId, issue.companyId),
+            eq(issueComments.issueId, issue.id),
+          ))
+          .orderBy(asc(issueComments.createdAt)),
+      ]);
+
+      const userComments = comments.filter((comment) => comment.authorUserId);
+      if (rows.length === 0 || userComments.length === 0) return [];
+
+      const now = new Date();
+      const expired: IssueThreadInteraction[] = [];
+      for (const row of rows) {
+        const interaction = hydrateInteraction(row) as RequestConfirmationInteraction;
+        if (!shouldSupersedeRequestConfirmationOnUserComment(interaction)) continue;
+
+        const supersedingComment = userComments.find((comment) => isCommentAtOrAfterInteraction({
+          commentCreatedAt: comment.createdAt,
+          interactionCreatedAt: row.createdAt,
+        }));
+        if (!supersedingComment) continue;
+
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: {
+              version: 1,
+              outcome: "superseded_by_comment",
+              commentId: supersedingComment.id,
+            },
+            resolvedByAgentId: null,
+            resolvedByUserId: supersedingComment.authorUserId,
             resolvedAt: now,
             updatedAt: now,
           })

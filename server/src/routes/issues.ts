@@ -4568,7 +4568,17 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const interactions = await issueThreadInteractionService(db).listForIssue(id);
+    const actor = getActorInfo(req);
+    const interactionSvc = issueThreadInteractionService(db);
+    const expiredInteractions = await interactionSvc.expireRequestConfirmationsSupersededByHistoricalComments(issue);
+    await logExpiredRequestConfirmations({
+      issue,
+      interactions: expiredInteractions,
+      actor,
+      source: "issue.interactions.catchup_superseded_by_comment",
+    });
+
+    const interactions = await interactionSvc.listForIssue(id);
     res.json(interactions);
   });
 
