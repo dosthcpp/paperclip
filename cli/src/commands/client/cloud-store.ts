@@ -1,3 +1,4 @@
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { resolvePaperclipInstanceRoot } from "../../config/home.js";
@@ -39,6 +40,13 @@ interface CloudConnectionStore {
   currentConnectionId?: string;
 }
 
+interface EncryptedCloudCredential {
+  scheme: "local_encrypted_v1";
+  iv: string;
+  tag: string;
+  ciphertext: string;
+}
+
 function defaultStore(): CloudConnectionStore {
   return {
     version: 1,
@@ -76,7 +84,7 @@ export function writeCloudConnectionStore(
   storePath = resolveCloudConnectionStorePath(),
 ): void {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  fs.writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(storePath, `${JSON.stringify(serializeStore(store), null, 2)}\n`, { mode: 0o600 });
 }
 
 export function upsertCloudConnection(
@@ -130,11 +138,11 @@ function normalizeConnection(value: unknown): CloudConnection | null {
   const targetHost = stringValue(record.targetHost);
   const stackId = stringValue(record.stackId);
   const targetCompanyId = stringValue(record.targetCompanyId);
-  const accessToken = stringValue(record.accessToken);
+  const accessToken = readCredential(record, "accessToken", "accessTokenMaterial");
   const token = typeof record.token === "object" && record.token !== null && !Array.isArray(record.token)
     ? record.token as CloudConnectionTokenRecord
     : null;
-  const privateKeyPem = stringValue(record.privateKeyPem);
+  const privateKeyPem = readCredential(record, "privateKeyPem", "privateKeyMaterial");
   const sourcePublicKey = stringValue(record.sourcePublicKey);
   const sourceInstanceId = stringValue(record.sourceInstanceId);
   const sourceInstanceFingerprint = stringValue(record.sourceInstanceFingerprint);
@@ -174,4 +182,118 @@ function stringValue(value: unknown): string | null {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function readCredential(record: Record<string, unknown>, plaintextKey: string, materialKey: string): string | null {
+  const material = record[materialKey];
+  if (material && typeof material === "object" && !Array.isArray(material)) {
+    try {
+      return decryptCredential(material as Record<string, unknown>);
+    } catch {
+      return null;
+    }
+  }
+  return stringValue(record[plaintextKey]);
+}
+
+function serializeStore(store: CloudConnectionStore): Record<string, unknown> {
+  const connections: Record<string, unknown> = {};
+  for (const [id, connection] of Object.entries(store.connections)) {
+    connections[id] = serializeConnection(connection);
+  }
+  return {
+    version: 1,
+    connections,
+    ...(store.currentConnectionId ? { currentConnectionId: store.currentConnectionId } : {}),
+  };
+}
+
+function serializeConnection(connection: CloudConnection): Record<string, unknown> {
+  const { accessToken, privateKeyPem, ...rest } = connection;
+  return {
+    ...rest,
+    accessTokenMaterial: encryptCredential(accessToken),
+    privateKeyMaterial: encryptCredential(privateKeyPem),
+  };
+}
+
+function encryptCredential(value: string): EncryptedCloudCredential {
+  const iv = randomBytes(12);
+  const key = loadOrCreateCredentialKey();
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return {
+    scheme: "local_encrypted_v1",
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  };
+}
+
+function decryptCredential(material: Record<string, unknown>): string {
+  if (
+    material.scheme !== "local_encrypted_v1" ||
+    typeof material.iv !== "string" ||
+    typeof material.tag !== "string" ||
+    typeof material.ciphertext !== "string"
+  ) {
+    throw new Error("Invalid encrypted cloud credential material");
+  }
+  const decipher = createDecipheriv(
+    "aes-256-gcm",
+    loadOrCreateCredentialKey(),
+    Buffer.from(material.iv, "base64"),
+  );
+  decipher.setAuthTag(Buffer.from(material.tag, "base64"));
+  const plain = Buffer.concat([
+    decipher.update(Buffer.from(material.ciphertext, "base64")),
+    decipher.final(),
+  ]);
+  return plain.toString("utf8");
+}
+
+function loadOrCreateCredentialKey(): Buffer {
+  const envKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+  if (envKey?.trim()) {
+    const decoded = decodeCredentialKey(envKey);
+    if (!decoded) throw new Error("Invalid PAPERCLIP_SECRETS_MASTER_KEY");
+    return decoded;
+  }
+
+  const keyPath = path.resolve(
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE?.trim() ||
+      path.join(resolvePaperclipInstanceRoot(), "secrets", "master.key"),
+  );
+  if (fs.existsSync(keyPath)) {
+    const decoded = decodeCredentialKey(fs.readFileSync(keyPath, "utf8"));
+    if (!decoded) throw new Error(`Invalid secrets master key at ${keyPath}`);
+    return decoded;
+  }
+
+  fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+  const generated = randomBytes(32);
+  fs.writeFileSync(keyPath, generated.toString("base64"), { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.chmodSync(keyPath, 0o600);
+  } catch {
+    // Best effort; the credential store itself is also written 0600.
+  }
+  return generated;
+}
+
+function decodeCredentialKey(raw: string): Buffer | null {
+  const trimmed = raw.trim();
+  if (/^[A-Fa-f0-9]{64}$/.test(trimmed)) {
+    return Buffer.from(trimmed, "hex");
+  }
+  try {
+    const decoded = Buffer.from(trimmed, "base64");
+    if (decoded.length === 32) return decoded;
+  } catch {
+    // ignored
+  }
+  if (Buffer.byteLength(trimmed, "utf8") === 32) {
+    return Buffer.from(trimmed, "utf8");
+  }
+  return null;
 }

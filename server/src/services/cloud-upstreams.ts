@@ -340,7 +340,7 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
       }
       return updateRun(row.id, {
         status: "cancelled",
-        activeStep: "push",
+        activeStep: row.activeStep,
         progressPercent: 100,
         completedAt: new Date(),
         events: [
@@ -500,6 +500,8 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
       const completedAt = new Date();
       const finalEvents = [
         ...input.initialEvents,
+        event(completedAt.toISOString(), "scan", "completed", "Scanned the local company inventory."),
+        event(completedAt.toISOString(), "preview", "completed", "Generated the transfer manifest."),
         event(completedAt.toISOString(), "push", "completed", "Pushed mapped objects without duplicate creation."),
         event(completedAt.toISOString(), "verify", "completed", "Verified the cloud import ledger and generated a run report."),
         event(completedAt.toISOString(), "activate", "completed", "Activation checklist is ready for manual unpause decisions."),

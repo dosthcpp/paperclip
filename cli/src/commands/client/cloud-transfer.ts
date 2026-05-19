@@ -144,7 +144,8 @@ export class LocalUpstreamPushCoordinator {
   async preview(bundle: LocalUpstreamExportBundle): Promise<unknown> {
     return this.post(`/api/companies/${encodeURIComponent(this.#paperclipCompanyId)}/upstream-imports/preview`, {
       manifest: bundle.manifest,
-      entities: bundle.entities,
+      previewShape: "manifest_only",
+      conflictKeysBySource: conflictKeysBySource(bundle.entities),
     });
   }
 
@@ -189,6 +190,21 @@ export class LocalUpstreamPushCoordinator {
     });
     return parseCoordinatorResponse(response);
   }
+}
+
+function conflictKeysBySource(entities: LocalUpstreamExportEntity[]): Record<string, string[]> {
+  const output: Record<string, string[]> = {};
+  for (const entity of entities) {
+    if (!entity.conflictKeys?.length) continue;
+    output[sourceEntityKeyString(entity.record.key)] = [...entity.conflictKeys];
+  }
+  return output;
+}
+
+function sourceEntityKeyString(key: SourceEntityKey): string {
+  return [key.sourceInstanceId, key.sourceCompanyId, key.sourceEntityType, key.sourceEntityId]
+    .map((part) => encodeURIComponent(part))
+    .join("/");
 }
 
 export function buildLocalUpstreamExportBundle(

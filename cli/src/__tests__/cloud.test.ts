@@ -14,7 +14,7 @@ import {
   normalizedContentHash,
   type LocalUpstreamExportBundle,
 } from "../commands/client/cloud-transfer.js";
-import { getCloudConnection } from "../commands/client/cloud-store.js";
+import { getCloudConnection, resolveCloudConnectionStorePath } from "../commands/client/cloud-store.js";
 
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
@@ -75,6 +75,11 @@ describe("cloud CLI helpers", () => {
 
     expect(connection.accessToken).toBe("upt_test");
     expect(getCloudConnection("https://cloud.example.test")?.token.id).toBe("token-1");
+    const rawStore = fs.readFileSync(resolveCloudConnectionStorePath(), "utf8");
+    expect(rawStore).not.toContain("upt_test");
+    expect(rawStore).not.toContain("PRIVATE KEY");
+    expect(rawStore).toContain("accessTokenMaterial");
+    expect(rawStore).toContain("privateKeyMaterial");
   });
 
   it("hard-blocks incompatible transfer schema versions with the stable schema exit code", () => {
@@ -115,6 +120,31 @@ describe("cloud CLI helpers", () => {
     expect(runBodies[0]?.manifest.idempotencyKey).toBe(runBodies[1]?.manifest.idempotencyKey);
     expect(chunkBodies[0]).toEqual(chunkBodies[2]);
     expect(chunkBodies[1]).toEqual(chunkBodies[3]);
+  });
+
+  it("uses the manifest-only request shape for CLI previews", async () => {
+    const bundle = await buildTestBundle();
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const coordinator = new LocalUpstreamPushCoordinator({
+      targetOrigin: "https://cloud.example.test",
+      paperclipCompanyId: "target-company-1",
+      fetch: async (url, init) => {
+        const parsed = new URL(String(url));
+        calls.push({ path: parsed.pathname, body: init?.body ? JSON.parse(String(init.body)) as unknown : {} });
+        return jsonResponse({ warnings: [], conflicts: [] });
+      },
+    });
+
+    await coordinator.preview(bundle);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe("/api/companies/target-company-1/upstream-imports/preview");
+    expect(calls[0]?.body).toMatchObject({
+      manifest: bundle.manifest,
+      previewShape: "manifest_only",
+      conflictKeysBySource: {},
+    });
+    expect(calls[0]?.body).not.toHaveProperty("entities");
   });
 });
 
