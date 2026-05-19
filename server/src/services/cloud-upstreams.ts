@@ -253,9 +253,15 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
       }
 
       const bundle = await buildBundle(connection, "preview");
+      const conflictKeysBySource: Record<string, string[]> = {};
+      for (const entity of bundle.entities) {
+        if (!entity.conflictKeys || entity.conflictKeys.length === 0) continue;
+        conflictKeysBySource[sourceEntityKeyString(entity.record.key)] = [...entity.conflictKeys];
+      }
       const remotePreview = await remotePost(connection, `/api/companies/${encodeURIComponent(connection.targetCompanyId)}/upstream-imports/preview`, {
         manifest: bundle.manifest,
-        entities: bundle.entities,
+        previewShape: "manifest_only",
+        conflictKeysBySource,
       });
       return {
         ...basePreview,
@@ -1057,6 +1063,12 @@ function sortJson(value: unknown): unknown {
 
 function shortHash(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function sourceEntityKeyString(key: SourceEntityKey): string {
+  return [key.sourceInstanceId, key.sourceCompanyId, key.sourceEntityType, key.sourceEntityId]
+    .map((part) => encodeURIComponent(part))
+    .join("/");
 }
 
 function titleFromCode(code: string): string {
