@@ -596,7 +596,7 @@ export function cloudUpstreamService(db: Db, options: { instanceId?: string } = 
       completedAt: new Date(),
       events: [
         ...row.events,
-        event(new Date().toISOString(), "push", "failed", "Cloud upstream push stopped before completion. Retry to resume with the same idempotency safeguards."),
+        event(new Date().toISOString(), cloudUpstreamStep(row.activeStep), "failed", "Cloud upstream push stopped before completion. Retry to resume with the same idempotency safeguards."),
       ],
       report: {
         ...asRecord(row.report),
