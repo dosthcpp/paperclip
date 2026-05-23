@@ -4118,7 +4118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continuationAttempt: decision.nextAttempt,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, continuationRun.id));
+        .where(eq(heartbeatRuns.id, run.id));
     }
   }
 
