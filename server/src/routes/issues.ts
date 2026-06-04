@@ -117,6 +117,7 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
+import { contentDispositionFilename } from "../lib/content-disposition.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -6306,7 +6307,7 @@ export function issueRoutes(
     const disposition = parseBooleanQuery(req.query.download)
       ? "attachment"
       : isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
-    res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
+    res.setHeader("Content-Disposition", `${disposition}; ${contentDispositionFilename(filename)}`);
 
     object.stream.on("error", (err) => {
       next(err);
