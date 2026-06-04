@@ -163,29 +163,48 @@ export function __resetSearchDegradationForTests(): void {
 export function enterDegradedSearchMode(
   db: Db,
   opts: { reason: string; now: string; logger?: SearchIndexLogger },
-): Promise<void> {
-  if (degradationState.degraded) return Promise.resolve();
-  if (degradeInFlight) return degradeInFlight;
+): Promise<SearchDegradationState> {
+  const snapshot = (): SearchDegradationState => getSearchDegradation();
+  if (degradationState.degraded) return Promise.resolve(snapshot());
+  if (degradeInFlight) return degradeInFlight.then(snapshot);
 
   degradeInFlight = (async () => {
     const dropped: string[] = [];
+    const failed: string[] = [];
     for (const { index } of TRIGRAM_SEARCH_INDEXES) {
       try {
         await db.execute(sql.raw(`DROP INDEX IF EXISTS "${index}"`));
         dropped.push(index);
       } catch (dropError) {
+        failed.push(index);
         opts.logger?.error?.(
           { err: dropError, index },
           "Failed to drop trigram index while degrading search (TON-2145)",
         );
       }
     }
+
+    // Only claim degraded if we actually removed at least one trigram index. If EVERY drop
+    // failed (e.g. lock_timeout on the required ACCESS EXCLUSIVE lock), the indexes are still
+    // live — the write cannot be made non-fatal this attempt, so we must NOT record a false
+    // degraded state. Leaving `degraded` false lets the next failing write retry the drop
+    // (the lock contention may have cleared). (TON-2145, raised in PR #7482 review.)
+    if (dropped.length === 0) {
+      opts.logger?.error?.(
+        { reason: opts.reason, failedIndexes: failed, since: opts.now },
+        "SEARCH DEGRADE FAILED: pg_trgm unloadable AND every trigram DROP INDEX failed; " +
+          "trigram indexes remain live so this write cannot complete. Will retry the drop on " +
+          "the next failing write (TON-2145, incident TON-2143).",
+      );
+      return;
+    }
+
     degradationState.degraded = true;
     degradationState.reason = opts.reason;
     degradationState.since = opts.now;
     degradationState.droppedIndexes = dropped;
     opts.logger?.error?.(
-      { reason: opts.reason, droppedIndexes: dropped, since: opts.now },
+      { reason: opts.reason, droppedIndexes: dropped, failedIndexes: failed, since: opts.now },
       "SEARCH DEGRADED: pg_trgm unloadable at runtime; dropped trigram GIN indexes to keep " +
         "comment/document/issue writes non-fatal. Restore search by fixing the extension and " +
         "re-running migrations / REINDEX (TON-2145, see incident TON-2143).",
@@ -194,7 +213,7 @@ export function enterDegradedSearchMode(
     degradeInFlight = null;
   });
 
-  return degradeInFlight;
+  return degradeInFlight.then(snapshot);
 }
 
 /**
@@ -221,13 +240,22 @@ export async function withSearchIndexFallback<T>(
       "Trigram search-index maintenance failed on write path; degrading search and retrying " +
         "so the write is non-fatal (TON-2145)",
     );
-    await enterDegradedSearchMode(db, {
+    const degradation = await enterDegradedSearchMode(db, {
       reason: `trigram_unavailable:${opts.operationName}`,
       now,
       logger: opts.logger,
     });
 
-    // Retry once: the trigram indexes are gone now, so the write no longer touches pg_trgm.
+    // If degradation could not remove any trigram index (every DROP failed), the indexes are
+    // still live and a retry would just re-throw the same trigram error. Surface the original
+    // failure honestly instead of looping or pretending the write succeeded. (TON-2145, PR
+    // #7482 review.)
+    if (degradation.droppedIndexes.length === 0) {
+      throw error;
+    }
+
+    // At least one trigram index was dropped, so retry once. (If the write still touches a
+    // table whose index could not be dropped, this re-throws and propagates — best effort.)
     return await operation();
   }
 }

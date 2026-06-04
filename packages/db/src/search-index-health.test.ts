@@ -102,6 +102,25 @@ describe("withSearchIndexFallback", () => {
     expect(getSearchDegradation().degraded).toBe(false);
     expect(db.execute).not.toHaveBeenCalled();
   });
+
+  // PR #7482 review (Greptile P1): if every DROP INDEX fails (e.g. lock_timeout), the indexes
+  // are still live, so the fallback must surface the original error rather than falsely
+  // claiming degraded and looping.
+  it("rethrows the original error and does NOT degrade when every DROP INDEX fails", async () => {
+    const db = fakeDb(async () => {
+      throw new Error("canceling statement due to lock_timeout");
+    });
+    const trigramError = new Error(TON_2143_MESSAGE);
+    await expect(
+      withSearchIndexFallback(db, async () => {
+        throw trigramError;
+      }, { operationName: "issue_comment.insert" }),
+    ).rejects.toBe(trigramError);
+
+    expect(getSearchDegradation().degraded).toBe(false);
+    // One DROP attempt per index (all failed), but no retry of the operation.
+    expect(db.execute).toHaveBeenCalledTimes(TRIGRAM_SEARCH_INDEXES.length);
+  });
 });
 
 describe("enterDegradedSearchMode", () => {
@@ -114,6 +133,28 @@ describe("enterDegradedSearchMode", () => {
     const degradation = getSearchDegradation();
     expect(degradation.reason).toBe("first");
     expect(degradation.since).toBe("t0");
+  });
+
+  it("returns degraded=false and records nothing when all drops fail", async () => {
+    const db = fakeDb(async () => {
+      throw new Error("lock_timeout");
+    });
+    const result = await enterDegradedSearchMode(db, { reason: "all-fail", now: "t0" });
+    expect(result.degraded).toBe(false);
+    expect(result.droppedIndexes).toEqual([]);
+    expect(getSearchDegradation().degraded).toBe(false);
+  });
+
+  it("degrades on partial success (at least one index dropped)", async () => {
+    let call = 0;
+    const db = fakeDb(async () => {
+      call += 1;
+      if (call === 1) throw new Error("lock_timeout"); // first index fails
+      return [];
+    });
+    const result = await enterDegradedSearchMode(db, { reason: "partial", now: "t1" });
+    expect(result.degraded).toBe(true);
+    expect(result.droppedIndexes).toEqual(TRIGRAM_SEARCH_INDEXES.slice(1).map((i) => i.index));
   });
 });
 
