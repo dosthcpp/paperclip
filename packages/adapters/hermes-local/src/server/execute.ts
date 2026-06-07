@@ -283,6 +283,24 @@ const TOKEN_USAGE_REGEX = /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:outp
 /** Regex to extract cost from Hermes output. */
 const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
 
+/**
+ * Valid Hermes session id shapes. CLI sessions are `YYYYMMDD_HHMMSS_<hex>`
+ * (e.g. `20260607_235905_41c7c7`); ACP sessions are UUIDs. Anything else must
+ * never reach `hermes chat --resume`: Hermes aborts with "Session not found"
+ * and `return False` (no fresh-session fallback), which fails the Paperclip run
+ * and triggers reassignment. Two real culprits this guards against (TON-2274):
+ *   - the loose legacy regex capturing a bare word like `from` out of a
+ *     "session saved from <path>" log line, and
+ *   - falling back to the Paperclip-side `ctx.runtime.sessionId` (a truncated
+ *     id like `20260607_235905_` with no hex suffix), which is never a Hermes id.
+ */
+const HERMES_SESSION_ID_REGEX =
+  /^(?:\d{8}_\d{6}_[0-9a-f]{4,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+export function isValidHermesSessionId(id: string | null | undefined): id is string {
+  return typeof id === "string" && HERMES_SESSION_ID_REGEX.test(id.trim());
+}
+
 interface ParsedHermesOutput {
   sessionId?: string | null;
   response?: string;
@@ -335,17 +353,21 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedHermesOutput {
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
+    // Only accept a well-formed Hermes id; a malformed capture must not be
+    // persisted (it would fail the next resume). See isValidHermesSessionId.
+    result.sessionId = isValidHermesSessionId(sessionMatch[1]) ? sessionMatch[1] : null;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
       result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
     }
   } else {
-    // Legacy format (non-quiet mode)
+    // Legacy format (non-quiet mode). The legacy regex is deliberately loose
+    // and can grab a stray word (e.g. "from" out of "session saved from ..."),
+    // so the format guard is essential here.
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
+    if (legacyMatch?.[1] && isValidHermesSessionId(legacyMatch[1])) {
+      result.sessionId = legacyMatch[1];
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -471,13 +493,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const canResumeSession =
     persistSession &&
-    runtimeSessionId.length > 0 &&
+    isValidHermesSessionId(runtimeSessionId) &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
   const resumeSessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !canResumeSession) {
+    const reason = isValidHermesSessionId(runtimeSessionId)
+      ? `was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}"`
+      : `is not a valid Hermes session id and will not be resumed`;
     await ctx.onLog(
       "stdout",
-      `[hermes] Session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}". Starting a fresh session.\n`,
+      `[hermes] Session "${runtimeSessionId}" ${reason}. Starting a fresh session.\n`,
     );
   }
 
@@ -646,8 +671,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Resolve the session id to persist. When a resumed run's quiet output omits
   // the session_id line, fall back to the id we resumed from so the thread is
-  // not dropped on the next wake (session continuity).
-  const resolvedSessionId = parsed.sessionId || resumeSessionId || null;
+  // not dropped on the next wake (session continuity). But if Hermes reported
+  // the resume target was missing, do NOT persist it forward — otherwise every
+  // subsequent wake re-resumes the same dead id, fails, and reassigns (TON-2274).
+  const sessionNotFound = /Session not found:/i.test(result.stderr || "");
+  const resolvedSessionId =
+    parsed.sessionId || (sessionNotFound ? null : resumeSessionId) || null;
 
   // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
   executionResult.resultJson = {
