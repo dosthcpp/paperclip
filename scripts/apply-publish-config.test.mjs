@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  statSync,
   symlinkSync,
   writeFileSync,
   rmSync,
@@ -154,6 +156,42 @@ test("never writes through a symlinked package dir (workspace-source safety)", (
 
     // Source manifest must be byte-for-byte unchanged.
     assert.equal(readFileSync(srcManifest, "utf8"), before, "source must be untouched");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("never corrupts a hardlinked source manifest (pnpm store safety)", () => {
+  // Reproduces the TON-2280 corruption mechanism: `pnpm deploy` hardlinks the
+  // deployed package.json back to the editable workspace source (same inode).
+  // Patching the deploy copy must NOT write through to the source.
+  const root = mkdtempSync(join(tmpdir(), "apc-hl-"));
+  try {
+    const dev = readDevPkg("packages/shared");
+
+    // Editable source manifest.
+    const srcDir = join(root, "src-pkg");
+    mkdirSync(srcDir, { recursive: true });
+    const srcManifest = join(srcDir, "package.json");
+    const before = JSON.stringify(dev, null, 2) + "\n";
+    writeFileSync(srcManifest, before);
+
+    // Deploy output: a HARDLINK to the source manifest (pnpm store behavior).
+    const outDir = join(root, "node_modules", "@paperclipai", "shared");
+    mkdirSync(outDir, { recursive: true });
+    const outManifest = join(outDir, "package.json");
+    linkSync(srcManifest, outManifest);
+    assert.equal(statSync(srcManifest).ino, statSync(outManifest).ino, "precondition: hardlinked");
+
+    const r = applyToPackage(outDir);
+    assert.equal(r.status, "patched");
+
+    // Deploy copy is patched (points at dist)...
+    const out = JSON.parse(readFileSync(outManifest, "utf8"));
+    assert.deepEqual(out.exports, dev.publishConfig.exports);
+    // ...but the source is byte-for-byte unchanged, and the hardlink is broken.
+    assert.equal(readFileSync(srcManifest, "utf8"), before, "source must be untouched");
+    assert.notEqual(statSync(srcManifest).ino, statSync(outManifest).ino, "hardlink must be broken");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

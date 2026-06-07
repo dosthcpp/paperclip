@@ -34,7 +34,15 @@
  * Exit code 0 on success; non-zero on hard failure.
  */
 
-import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import {
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 
 // Fields that npm overlays from publishConfig onto the manifest at pack time.
@@ -148,10 +156,35 @@ function applyToPackage(pkgDir) {
 
   if (changed) {
     // Preserve trailing newline convention used across the repo.
-    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+    writeManifestBreakingHardlinks(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
     return { pkgDir, status: "patched", name: pkg.name };
   }
   return { pkgDir, status: "ok", name: pkg.name };
+}
+
+/**
+ * SAFETY (TON-2280): `pnpm deploy` populates the output via pnpm's
+ * content-addressable store, which HARDLINKS each deployed package.json back to
+ * the editable workspace source (same inode, nlink>1). An in-place writeFileSync
+ * would write THROUGH that shared inode and silently corrupt the source tree
+ * (exports flipped ./src -> ./dist). Writing a temp file and renaming over the
+ * target gives the output path a fresh inode, leaving the hardlinked source
+ * untouched. Symlinks are already skipped during discovery; this covers
+ * hardlinks, which realpath/lstat cannot detect.
+ */
+function writeManifestBreakingHardlinks(pkgPath, contents) {
+  const tmp = `${pkgPath}.apc-${process.pid}.tmp`;
+  writeFileSync(tmp, contents);
+  try {
+    renameSync(tmp, pkgPath);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
 }
 
 function main(argv) {
