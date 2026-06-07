@@ -63,7 +63,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL. |
 | ${INSTRUCTIONS_PATH_KEY} | string | (none) | Absolute path to a markdown instructions file (e.g. TOOLS.md / HEARTBEAT.md / AGENTS.md) delivered to the agent at runtime via Paperclip's instruction bundle. |
 | maxTurns | number | (Hermes default) | Agent turn budget per run; prevents single-turn "print code and exit". |
-| yolo | boolean | false | Bypass dangerous-command approval prompts (agents have no TTY). |
+| yolo | boolean | true | Bypass dangerous-command approval prompts. Defaults on because Paperclip agents have no TTY to answer a prompt; set false only for TTY-attached runs. |
 | toolsets | string | (all) | Comma-separated toolsets to enable (e.g. "terminal,file,web"). |
 | persistSession | boolean | true | Resume sessions across heartbeats. |
 | command | string | "hermes" | CLI binary name. |

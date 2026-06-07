@@ -10,7 +10,7 @@ const hermesExecuteMock = vi.hoisted(() =>
   })),
 );
 
-vi.mock("hermes-paperclip-adapter/server", () => ({
+vi.mock("@paperclipai/adapter-hermes-local/server", () => ({
   execute: hermesExecuteMock,
   testEnvironment: async () => ({
     adapterType: "hermes_local",
@@ -191,6 +191,17 @@ describe("server adapter registry", () => {
     expect(adapter!.supportsInstructionsBundle).toBe(true);
     expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
     expect(adapter!.requiresMaterializedRuntimeSkills).toBe(false);
+    expect(adapter!.supportsLocalAgentJwt).toBe(true);
+  });
+
+  it("built-in hermes_local adapter materializes the instruction bundle (TON-2270)", () => {
+    // Regression guard: hermes_local was the only adapter with
+    // supportsInstructionsBundle:false and no instructionsPathKey, so
+    // TOOLS.md / HEARTBEAT.md / AGENTS.md were never delivered to Hermes.
+    const adapter = findActiveServerAdapter("hermes_local");
+    expect(adapter).not.toBeNull();
+    expect(adapter!.supportsInstructionsBundle).toBe(true);
+    expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
     expect(adapter!.supportsLocalAgentJwt).toBe(true);
   });
 

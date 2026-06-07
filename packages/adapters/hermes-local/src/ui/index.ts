@@ -1,11 +1,11 @@
 /**
- * UI surface for the in-tree Hermes Agent adapter (TON-2230, Option B).
+ * UI module exports — used by Paperclip's dashboard for run viewing
+ * and agent configuration forms.
  *
- * Phase 1 baseline: re-export the external UI helpers. Vendored in Phase 2.
+ * Phase 2 (TON-2269): vendored in-tree from the external
+ * `hermes-paperclip-adapter` package. The UI registry imports these
+ * symbols via `@paperclipai/adapter-hermes-local/ui`.
  */
 
-export {
-  agentConfigurationDoc,
-  models,
-  // eslint-disable-next-line import/no-unresolved -- temporary Phase-1 baseline; vendored in Phase 2
-} from "hermes-paperclip-adapter";
+export { parseHermesStdoutLine } from "./parse-stdout.js";
+export { buildHermesConfig } from "./build-config.js";

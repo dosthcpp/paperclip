@@ -1,6 +1,6 @@
 import type { UIAdapterModule } from "../types";
-import { parseHermesStdoutLine } from "hermes-paperclip-adapter/ui";
-import { buildHermesConfig } from "hermes-paperclip-adapter/ui";
+import { parseHermesStdoutLine } from "@paperclipai/adapter-hermes-local/ui";
+import { buildHermesConfig } from "@paperclipai/adapter-hermes-local/ui";
 import { SchemaConfigFields } from "../schema-config-fields";
 
 export const hermesLocalUIAdapter: UIAdapterModule = {

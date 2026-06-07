@@ -132,11 +132,11 @@ import {
   listSkills as hermesListSkills,
   syncSkills as hermesSyncSkills,
   detectModel as detectModelFromHermes,
-} from "hermes-paperclip-adapter/server";
+} from "@paperclipai/adapter-hermes-local/server";
 import {
   agentConfigurationDoc as hermesAgentConfigurationDoc,
   models as hermesModels,
-} from "hermes-paperclip-adapter";
+} from "@paperclipai/adapter-hermes-local";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
@@ -182,6 +182,11 @@ function buildCursorRuntimeCommandSpec(config: Record<string, unknown>): Adapter
   };
 }
 
+// Backward-compat: agents/runtimes that set the legacy `command` key (rather
+// than `hermesCommand`) still resolve the correct binary. build-config writes
+// `hermesCommand`, but direct-API and pre-existing agents may carry `command`.
+// This narrows `unknown` config values — it is NOT a type-laundering cast (the
+// execute/testEnvironment type casts were the TON-2230 workaround and are gone).
 function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(ctx: T): T {
   const config =
     ctx && typeof ctx === "object" && "config" in ctx && ctx.config && typeof ctx.config === "object"
@@ -433,17 +438,18 @@ const piLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: piAgentConfigurationDoc,
 };
 
-// hermes-paperclip-adapter v0.2.0 predates the authToken field; cast is
-// intentional until hermes ships a matching AdapterExecutionContext type.
-const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
+// The in-tree @paperclipai/adapter-hermes-local types execute against the
+// current AdapterExecutionContext (TON-2269), so hermesExecute is directly
+// assignable to ServerAdapterModule["execute"] — no cast workaround needed.
+const executeHermesLocal = hermesExecute;
 
 const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
-  execute: async (ctx) => {
-    const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+  execute: async (rawCtx) => {
+    const ctx = normalizeHermesConfig(rawCtx);
+    if (!ctx.authToken) return executeHermesLocal(ctx);
 
-    const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+    const existingConfig = (ctx.agent.adapterConfig ?? {}) as Record<string, unknown>;
     const existingEnv =
       typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
         ? (existingConfig.env as Record<string, string>)
@@ -465,8 +471,8 @@ const hermesLocalAdapter: ServerAdapterModule = {
       ...existingConfig,
       env: {
         ...existingEnv,
-        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
-        PAPERCLIP_RUN_ID: normalizedCtx.runId,
+        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: ctx.authToken } : {}),
+        PAPERCLIP_RUN_ID: ctx.runId,
       },
     };
 
@@ -478,22 +484,23 @@ const hermesLocalAdapter: ServerAdapterModule = {
     }
 
     const patchedCtx = {
-      ...normalizedCtx,
+      ...ctx,
       agent: {
-        ...normalizedCtx.agent,
+        ...ctx.agent,
         adapterConfig: patchedConfig,
       },
     };
 
     return executeHermesLocal(patchedCtx);
   },
-  testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
+  testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx)),
   sessionCodec: hermesSessionCodec,
   listSkills: hermesListSkills,
   syncSkills: hermesSyncSkills,
   models: hermesModels,
   supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: false,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: hermesAgentConfigurationDoc,
   detectModel: () => detectModelFromHermes(),
