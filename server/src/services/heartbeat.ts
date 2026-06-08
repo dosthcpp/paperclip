@@ -1112,6 +1112,84 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+/**
+ * TON-2298: Detect whether an adapter run produced a real, non-empty completed
+ * response, independent of any `errorMessage` the adapter may have derived from
+ * benign stderr noise.
+ *
+ * Some local adapters (notably `hermes-paperclip-adapter`) set `errorMessage`
+ * whenever stderr matches `/error|exception|traceback|failed/i`, even when the
+ * process exited 0 and returned a valid agent response. Treating those runs as
+ * `failed` causes the issue to be misclassified `adapter_failed` and
+ * auto-reassigned to a different agent. We use this signal to demote such a
+ * stderr-derived `errorMessage` to a non-fatal warning.
+ *
+ * Returns true only when there is a non-empty `summary` or
+ * `resultJson.result` / `resultJson.summary` — so genuine exit-0-but-empty
+ * failures still classify as failed.
+ */
+export function hasCompletedAdapterResponse(adapterResult: {
+  summary?: string | null;
+  resultJson?: Record<string, unknown> | null;
+}): boolean {
+  if (readNonEmptyString(adapterResult.summary)) {
+    return true;
+  }
+  const resultJson = adapterResult.resultJson;
+  if (resultJson && typeof resultJson === "object") {
+    if (readNonEmptyString(resultJson.result)) {
+      return true;
+    }
+    if (readNonEmptyString(resultJson.summary)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export type AdapterRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+
+/**
+ * TON-2298: Pure classification of an adapter run's outcome.
+ *
+ * Centralizes the rule that an exit-0 run which produced a real completed
+ * response is `succeeded` even when the adapter set an `errorMessage` from a
+ * benign stderr heuristic. In that case the offending message is returned as
+ * `demotedErrorMessage` so the caller can log it as a non-fatal warning instead
+ * of failing (and auto-reassigning) the issue.
+ *
+ * `terminalStatus` short-circuits everything (the run was already finalized,
+ * e.g. cancelled out-of-band). Genuine exit-0-but-empty failures are excluded
+ * by hasCompletedAdapterResponse() and still classify as `failed`.
+ */
+export function classifyAdapterRunOutcome(input: {
+  terminalStatus?: AdapterRunOutcome | null;
+  timedOut: boolean;
+  exitCode: number | null;
+  errorMessage?: string | null;
+  summary?: string | null;
+  resultJson?: Record<string, unknown> | null;
+}): { outcome: AdapterRunOutcome; demotedErrorMessage: string | null } {
+  if (input.terminalStatus) {
+    return { outcome: input.terminalStatus, demotedErrorMessage: null };
+  }
+  if (input.timedOut) {
+    return { outcome: "timed_out", demotedErrorMessage: null };
+  }
+  const exitedClean = (input.exitCode ?? 0) === 0;
+  if (exitedClean && !input.errorMessage) {
+    return { outcome: "succeeded", demotedErrorMessage: null };
+  }
+  if (
+    exitedClean &&
+    input.errorMessage &&
+    hasCompletedAdapterResponse(input)
+  ) {
+    return { outcome: "succeeded", demotedErrorMessage: input.errorMessage };
+  }
+  return { outcome: "failed", demotedErrorMessage: null };
+}
+
 function readModelProfileKey(value: unknown): ModelProfileKey | null {
   return MODEL_PROFILE_KEYS.includes(value as ModelProfileKey)
     ? (value as ModelProfileKey)
@@ -8145,16 +8223,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
-      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-        outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
-        outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
-        outcome = "succeeded";
-      } else {
-        outcome = "failed";
+      const { outcome, demotedErrorMessage: demotedAdapterErrorMessage } =
+        classifyAdapterRunOutcome({
+          terminalStatus: isHeartbeatRunTerminalStatus(latestRun?.status)
+            ? latestRun.status
+            : null,
+          timedOut: adapterResult.timedOut,
+          exitCode: adapterResult.exitCode ?? null,
+          errorMessage: adapterResult.errorMessage ?? null,
+          summary: adapterResult.summary ?? null,
+          resultJson: adapterResult.resultJson ?? null,
+        });
+      if (demotedAdapterErrorMessage) {
+        // TON-2298: exit 0 + a real completed response, but the adapter set an
+        // errorMessage from a benign stderr heuristic (e.g. hermes matching
+        // /error|failed/ on log noise). We classified the run as succeeded;
+        // surface the warning without failing or auto-reassigning the issue.
+        await onLog(
+          "stderr",
+          `[paperclip] TON-2298: adapter reported a non-fatal stderr warning but produced a valid response; classifying run as succeeded. Warning: ${demotedAdapterErrorMessage}\n`,
+        );
       }
       const runErrorMessage =
         outcome === "cancelled"
