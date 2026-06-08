@@ -3,6 +3,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, ne, not, or, sql }
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companies,
   companySecretBindings,
   companySecretVersions,
   companySecrets,
@@ -854,6 +855,7 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    resultText?: string;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -869,12 +871,70 @@ export function routineService(
         .update(routineTriggers)
         .set({
           lastFiredAt: input.triggeredAt,
-          lastResult: nextResultText(input.status, input.issueId),
+          lastResult: input.resultText ?? nextResultText(input.status, input.issueId),
           nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
         .where(eq(routineTriggers.id, input.triggerId));
     }
+  }
+
+  // Records a suppressed scheduled firing when the workspace (company) is paused.
+  // The pause flag is an operator kill switch, so we leave an auditable
+  // `skipped: paused` run instead of dispatching an execution issue. Resume picks
+  // up on the next cron tick — the trigger's nextRunAt has already been advanced
+  // past `now`, so no missed firings are backfilled.
+  async function recordPausedSkip(input: {
+    routine: typeof routines.$inferSelect;
+    trigger: typeof routineTriggers.$inferSelect;
+    triggeredAt: Date;
+    nextRunAt: Date | null;
+  }) {
+    const [run] = await db
+      .insert(routineRuns)
+      .values({
+        companyId: input.routine.companyId,
+        routineId: input.routine.id,
+        triggerId: input.trigger.id,
+        source: "schedule",
+        status: "skipped",
+        triggeredAt: input.triggeredAt,
+        routineRevisionId: input.routine.latestRevisionId,
+        failureReason: "paused",
+        completedAt: input.triggeredAt,
+      })
+      .returning();
+
+    await updateRoutineTouchedState({
+      routineId: input.routine.id,
+      triggerId: input.trigger.id,
+      triggeredAt: input.triggeredAt,
+      status: "skipped",
+      nextRunAt: input.nextRunAt,
+      resultText: "Skipped because the workspace is paused",
+    });
+
+    try {
+      await logActivity(db, {
+        companyId: input.routine.companyId,
+        actorType: "system",
+        actorId: "routine-scheduler",
+        action: "routine.run_skipped",
+        entityType: "routine_run",
+        entityId: run.id,
+        details: {
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          source: "schedule",
+          status: "skipped",
+          reason: "paused",
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log paused routine skip");
+    }
+
+    return run;
   }
 
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
@@ -2315,9 +2375,11 @@ export function routineService(
         .select({
           trigger: routineTriggers,
           routine: routines,
+          companyStatus: companies.status,
         })
         .from(routineTriggers)
         .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
+        .innerJoin(companies, eq(routines.companyId, companies.id))
         .where(
           and(
             eq(routineTriggers.kind, "schedule"),
@@ -2330,13 +2392,20 @@ export function routineService(
         .orderBy(asc(routineTriggers.nextRunAt), asc(routineTriggers.createdAt));
 
       let triggered = 0;
+      let skippedPaused = 0;
       for (const row of due) {
         if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
+
+        // The workspace pause flag (company status) acts as an operator kill
+        // switch. When paused we advance to the next single cron tick after `now`
+        // without catching up missed firings, so resume returns to normal cadence
+        // rather than backfilling the suppressed window.
+        const companyPaused = row.companyStatus === "paused";
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
 
-        if (row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
+        if (!companyPaused && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           let cursor: Date | null = row.trigger.nextRunAt;
           runCount = 0;
           while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
@@ -2363,6 +2432,17 @@ export function routineService(
           .then((rows) => rows[0] ?? null);
         if (!claimed) continue;
 
+        if (companyPaused) {
+          await recordPausedSkip({
+            routine: row.routine,
+            trigger: row.trigger,
+            triggeredAt: now,
+            nextRunAt: claimedNextRunAt,
+          });
+          skippedPaused += 1;
+          continue;
+        }
+
         for (let i = 0; i < runCount; i += 1) {
           await dispatchRoutineRun({
             routine: row.routine,
@@ -2373,7 +2453,7 @@ export function routineService(
         }
       }
 
-      return { triggered };
+      return { triggered, skippedPaused };
     },
 
     syncRunStatusForIssue: async (issueId: string) => {

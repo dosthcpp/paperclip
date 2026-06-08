@@ -778,7 +778,7 @@ export async function startServer(): Promise<StartedServer> {
       void routines
         .tickScheduledTriggers(new Date())
         .then((result) => {
-          if (result.triggered > 0) {
+          if (result.triggered > 0 || result.skippedPaused > 0) {
             logger.info({ ...result }, "routine scheduler tick enqueued runs");
           }
         })

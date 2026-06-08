@@ -1514,4 +1514,77 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.source).toBe("webhook");
     expect(run.status).toBe("issue_created");
   });
+
+  it("suppresses scheduled firings while the workspace is paused and resumes without backfill", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "schedule",
+        label: "hourly",
+        cronExpression: "0 * * * *",
+        timezone: "UTC",
+      },
+      {},
+    );
+
+    // Pause the workspace (company) and make the trigger due in the past.
+    await db
+      .update(companies)
+      .set({ status: "paused", pauseReason: "manual", pausedAt: new Date() })
+      .where(eq(companies.id, companyId));
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2026-01-01T00:00:00.000Z") })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    const pausedTickAt = new Date("2026-01-01T00:30:00.000Z");
+    const pausedResult = await svc.tickScheduledTriggers(pausedTickAt);
+
+    // (1) No execution issue is created while paused.
+    expect(pausedResult).toEqual({ triggered: 0, skippedPaused: 1 });
+    await expect(
+      db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id)),
+    ).resolves.toHaveLength(0);
+
+    // (2) Routine run history records the skip with reason "paused".
+    const runsAfterPause = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id));
+    expect(runsAfterPause).toHaveLength(1);
+    expect(runsAfterPause[0]).toMatchObject({
+      source: "schedule",
+      status: "skipped",
+      failureReason: "paused",
+      linkedIssueId: null,
+    });
+
+    // nextRunAt is advanced to the next single tick after the paused tick — no backfill window is retained.
+    const triggerAfterPause = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id))
+      .then((rows) => rows[0]);
+    expect(triggerAfterPause?.nextRunAt).toEqual(new Date("2026-01-01T01:00:00.000Z"));
+    expect(triggerAfterPause?.lastResult).toMatch(/paused/i);
+
+    // (3) Resume: ticking again at the paused timestamp must NOT fire the missed tick.
+    await db
+      .update(companies)
+      .set({ status: "active", pauseReason: null, pausedAt: null })
+      .where(eq(companies.id, companyId));
+    const resumeSameTime = await svc.tickScheduledTriggers(pausedTickAt);
+    expect(resumeSameTime).toEqual({ triggered: 0, skippedPaused: 0 });
+    await expect(
+      db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id)),
+    ).resolves.toHaveLength(0);
+
+    // The next scheduled cron tick fires normally once resumed.
+    const resumeResult = await svc.tickScheduledTriggers(new Date("2026-01-01T01:00:30.000Z"));
+    expect(resumeResult.triggered).toBe(1);
+    await expect(
+      db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id)),
+    ).resolves.toHaveLength(1);
+  });
 });
