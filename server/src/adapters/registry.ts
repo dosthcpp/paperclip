@@ -138,6 +138,7 @@ import {
   models as hermesModels,
 } from "hermes-paperclip-adapter";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
+import { applyHermesTerminalDisposition } from "./hermes-terminal-disposition.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { processAdapter } from "./process/index.js";
@@ -440,7 +441,10 @@ const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["exec
 const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
-    const normalizedCtx = normalizeHermesConfig(ctx);
+    // Bridge run task context into the adapter config and append the terminal
+    // disposition contract, so succeeded Hermes runs leave a disposition the
+    // successful-run-handoff detector accepts instead of looping (TON-2300).
+    const normalizedCtx = applyHermesTerminalDisposition(normalizeHermesConfig(ctx));
     if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
