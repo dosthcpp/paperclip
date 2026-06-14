@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -257,6 +257,38 @@ export function issueRecoveryActionService(db: Db) {
     return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
   }
 
+  /**
+   * Count historical recovery-action rows for an issue, optionally filtered by
+   * status / outcome / cause. Used by the loop-breaker (TON-2299) to read the
+   * persistent cross-cycle repeat counter: auto-cancelled rows
+   * (status=`cancelled`, outcome=`cancelled`) survive the cancel/recreate cycle, so
+   * counting them yields a counter that does NOT reset when a fresh action is created.
+   */
+  async function countHistoryForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    filter?: { statuses?: string[]; outcomes?: string[]; causes?: string[] },
+  ): Promise<number> {
+    const predicates = [
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+    ];
+    if (filter?.statuses?.length) {
+      predicates.push(inArray(issueRecoveryActions.status, filter.statuses));
+    }
+    if (filter?.outcomes?.length) {
+      predicates.push(inArray(issueRecoveryActions.outcome, filter.outcomes));
+    }
+    if (filter?.causes?.length) {
+      predicates.push(inArray(issueRecoveryActions.cause, filter.causes));
+    }
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issueRecoveryActions)
+      .where(and(...predicates));
+    return Number(row?.count ?? 0);
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -287,6 +319,7 @@ export function issueRecoveryActionService(db: Db) {
   }
 
   return {
+    countHistoryForIssue,
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
