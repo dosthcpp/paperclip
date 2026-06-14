@@ -48,6 +48,13 @@ import {
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
+  RECOVERY_LOOP_BREAKER_ACTIVITY_ACTION,
+  RECOVERY_LOOP_BREAKER_COMMENT_MARKER,
+  RECOVERY_LOOP_BREAKER_EVIDENCE_KEY,
+  RECOVERY_LOOP_BREAKER_THRESHOLD,
+  decideRecoveryLoopBreaker,
+} from "./loop-breaker.js";
+import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
   isStrandedIssueRecoveryOriginKind,
@@ -2261,6 +2268,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     recoveryCause: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    loopBreakerActivated?: boolean;
+    loopBreakerCycleCount?: number;
   }) {
     const context = parseObject(input.latestRun?.contextSnapshot);
     return {
@@ -2278,6 +2287,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       missingDisposition: input.successfulRunHandoffEvidence?.missingDisposition ?? null,
       handoffAttempt: input.successfulRunHandoffEvidence?.handoffAttempt ?? null,
       maxHandoffAttempts: input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
+      [RECOVERY_LOOP_BREAKER_EVIDENCE_KEY]: input.loopBreakerActivated === true,
+      loopBreakerCycleCount: input.loopBreakerCycleCount ?? 0,
     };
   }
 
@@ -2291,6 +2302,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     const now = new Date();
+
+    // TON-2299: count prior auto-cancelled recovery rows (status=cancelled,
+    // outcome=cancelled — exactly what source_revalidation writes) for this issue.
+    // This persistent, cause-agnostic history survives the cancel/recreate cycle that
+    // resets attemptCount, so it is the true cross-cycle repeat counter.
+    const priorAutoResolveCount = await recoveryActionsSvc.countHistoryForIssue(
+      input.issue.companyId,
+      input.issue.id,
+      { statuses: ["cancelled"], outcomes: ["cancelled"] },
+    );
+    const loopBreakerActivated = decideRecoveryLoopBreaker({ priorAutoResolveCount });
+
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -2310,30 +2333,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         previousStatus: input.previousStatus,
         recoveryCause,
         successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+        loopBreakerActivated,
+        loopBreakerCycleCount: priorAutoResolveCount,
       }),
-      nextAction: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-        ? "Choose and record a valid issue disposition without copying transcript content."
+      nextAction: loopBreakerActivated
+        ? `Loop-breaker engaged after ${priorAutoResolveCount} auto-resolve/re-escalate cycles. Automatic recovery is stopped; a human or the board must inspect why automation keeps finishing this issue without a durable disposition, then record an intentional manual resolution.`
+        : recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+          ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "workspace_validation_failed"
           ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
         : recoveryCause === "configuration_incomplete"
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-      wakePolicy: recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
+      wakePolicy: loopBreakerActivated
         ? {
-          type: "manual_repair_required",
-          reason: recoveryCause,
-          ownerAgentId,
+          type: "manual_review",
+          reason: RECOVERY_LOOP_BREAKER_COMMENT_MARKER,
         }
-        : ownerAgentId
-        ? {
-          type: "wake_owner",
-          reason: "source_scoped_recovery_action",
-          ownerAgentId,
-        }
-        : {
-          type: "board_escalation",
-          reason: "no_invokable_recovery_owner",
-        },
+        : recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
+          ? {
+            type: "manual_repair_required",
+            reason: recoveryCause,
+            ownerAgentId,
+          }
+          : ownerAgentId
+            ? {
+              type: "wake_owner",
+              reason: "source_scoped_recovery_action",
+              ownerAgentId,
+            }
+            : {
+              type: "board_escalation",
+              reason: "no_invokable_recovery_owner",
+            },
       monitorPolicy: null,
       maxAttempts: null,
       lastAttemptAt: now,
@@ -2403,6 +2435,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
       "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+    ].join("\n");
+  }
+
+  function buildRecoveryLoopBreakerComment(input: {
+    issue: typeof issues.$inferSelect;
+    recoveryActionId: string;
+    recoveryOwner: Awaited<ReturnType<typeof getAgent>> | null;
+    cycleCount: number;
+    prefix: string;
+  }) {
+    return [
+      "⚠️ Paperclip loop-breaker engaged — automatic recovery for this issue has been stopped.",
+      "",
+      `This issue has been auto-escalated and then auto-resolved (\`source_revalidation\`) ${input.cycleCount} times in a row, then re-escalated each cycle. That is an infinite successful-run-handoff loop: automation keeps finishing the run without recording a durable disposition, the recovery action is auto-cancelled the moment the issue looks live, and the next run re-triggers it.`,
+      "",
+      `- Recovery action: \`${input.recoveryActionId}\``,
+      `- Recovery owner: ${input.recoveryOwner ? agentUiLink(input.recoveryOwner, input.prefix) : "board escalation"}`,
+      `- Loop-breaker marker: \`${RECOVERY_LOOP_BREAKER_COMMENT_MARKER}\``,
+      "",
+      "The issue is now pinned to a terminal manual-review `blocked` state. It will NOT be auto-resolved or re-woken until a human or the board intervenes. Next action: inspect why the run finishes without a valid disposition, fix the root cause (e.g. the agent/adapter not recording a disposition), then record an intentional manual resolution or move the issue out of `blocked` deliberately.",
     ].join("\n");
   }
 
@@ -2563,6 +2615,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    const loopBreakerActivated =
+      (recoveryAction.evidence as Record<string, unknown> | null | undefined)?.[
+        RECOVERY_LOOP_BREAKER_EVIDENCE_KEY
+      ] === true;
+    const loopBreakerCycleCount = Number(
+      (recoveryAction.evidence as Record<string, unknown> | null | undefined)?.loopBreakerCycleCount ?? 0,
+    );
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
@@ -2605,11 +2664,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
       ].join("\n");
 
-    const shouldPostEscalationComment =
+    if (loopBreakerActivated) {
+      // Post the human-facing loop-breaker notice exactly once (idempotent on marker).
+      const hasLoopBreakerComment = await db
+        .select({ id: issueComments.id, body: issueComments.body })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.authorType, "system"),
+          ),
+        )
+        .orderBy(desc(issueComments.createdAt))
+        .limit(50)
+        .then((rows) => rows.some((row) =>
+          (row.body ?? "").includes(RECOVERY_LOOP_BREAKER_COMMENT_MARKER),
+        ));
+
+      if (!hasLoopBreakerComment) {
+        await issuesSvc.addComment(
+          input.issue.id,
+          buildRecoveryLoopBreakerComment({
+            issue: input.issue,
+            recoveryActionId: recoveryAction.id,
+            recoveryOwner,
+            cycleCount: loopBreakerCycleCount,
+            prefix,
+          }),
+          {},
+          { authorType: "system" },
+        );
+      }
+    } else if (
       recoveryAction.attemptCount === 1 ||
       input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
-    if (shouldPostEscalationComment) {
+      input.recoveryCause === "configuration_incomplete"
+    ) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
       const hasEscalationComment = await db
@@ -2676,6 +2766,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         blockerIssueIds: blockerIds,
       },
     });
+
+    if (loopBreakerActivated) {
+      // TON-2299: stop the auto-re-handoff. The issue stays pinned to a terminal
+      // manual-review `blocked` state; the revalidation skip-guard refuses to
+      // auto-resolve it, so no fresh recovery cycle can start. No owner/Atlas wake.
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: RECOVERY_LOOP_BREAKER_ACTIVITY_ACTION,
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "blocked",
+          previousStatus: input.previousStatus,
+          source: "recovery.loop_breaker",
+          recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
+          recoveryActionId: recoveryAction.id,
+          recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+          loopBreakerCycleCount,
+          threshold: RECOVERY_LOOP_BREAKER_THRESHOLD,
+          latestRunId: input.latestRun?.id ?? null,
+        },
+      });
+      return updated;
+    }
 
     await enqueueSourceScopedStrandedRecoveryWake({
       action: recoveryAction,

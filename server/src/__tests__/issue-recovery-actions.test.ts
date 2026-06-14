@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1176,5 +1176,121 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("engages the cross-cycle loop-breaker after repeated auto-resolve/re-escalate cycles (TON-2299)", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const baseRun = {
+      agentId: coderId,
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      contextSnapshot: { issueId: sourceIssue.id },
+      livenessState: "advanced",
+    } as const;
+
+    async function autoCancelActiveAction() {
+      // Emulate what `revalidateActiveSourceRecovery` writes (source_revalidation):
+      // status=cancelled, outcome=cancelled. These rows persist as durable history.
+      await db
+        .update(issueRecoveryActions)
+        .set({ status: "cancelled", outcome: "cancelled", resolvedAt: new Date() })
+        .where(
+          and(
+            eq(issueRecoveryActions.sourceIssueId, sourceIssue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          ),
+        );
+    }
+
+    // Run THRESHOLD (3) full escalate -> auto-resolve cycles. Each escalation creates
+    // a FRESH action with attemptCount reset to 1, so only durable history can count.
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: { ...baseRun, id: randomUUID() },
+        recoveryCause: "stranded_assigned_issue",
+      });
+      await autoCancelActiveAction();
+    }
+
+    const wakeCallsAfterCycles = enqueueWakeup.mock.calls.length;
+    expect(wakeCallsAfterCycles).toBe(3);
+
+    // The 4th escalation observes 3 prior auto-resolves -> loop-breaker engages.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: { ...baseRun, id: randomUUID() },
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    // (b) No further wake is enqueued on the loop-breaker escalation.
+    expect(enqueueWakeup.mock.calls.length).toBe(wakeCallsAfterCycles);
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssue.id);
+    expect(active).not.toBeNull();
+    expect(active?.evidence).toMatchObject({ loopBreakerActivated: true, loopBreakerCycleCount: 3 });
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(issueRow?.status).toBe("blocked");
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssue.id));
+    expect(activityRows.map((row) => row.action)).toContain("recovery.loop_breaker_activated");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(comments.some((c) => (c.body ?? "").includes("recovery.loop_breaker_activated"))).toBe(true);
+
+    // (skip-guard) Even when the source issue looks live again (status -> done), the
+    // revalidation read path must NOT auto-resolve a pinned loop-breaker action.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssue.id));
+    const app = createApp();
+    await request(app).get(`/api/issues/${sourceIssue.id}`).expect(200);
+    const stillActive = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssue.id);
+    expect(stillActive?.id).toBe(active?.id);
+    expect(stillActive?.status).toBe("active");
+  });
+
+  it("does not engage the loop-breaker on a single escalate/resolve cycle (TON-2299)", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "succeeded",
+        error: null,
+        errorCode: null,
+        contextSnapshot: { issueId: sourceIssue.id },
+        livenessState: "advanced",
+      },
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    // Normal first cycle still wakes the owner and is auto-resolvable.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssue.id);
+    expect(active?.evidence).toMatchObject({ loopBreakerActivated: false });
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssue.id));
+    const app = createApp();
+    await request(app).get(`/api/issues/${sourceIssue.id}`).expect(200);
+    // Without the loop-breaker flag, source_revalidation auto-resolves as before.
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssue.id)).toBeNull();
   });
 });
