@@ -183,6 +183,43 @@ function buildCursorRuntimeCommandSpec(config: Record<string, unknown>): Adapter
   };
 }
 
+// TON-2279: since paperclipai 2026.609.0 the server runs
+// secretsSvc.normalizeAdapterConfigForPersistence on every agent PATCH, which
+// rewrites each adapterConfig.env entry from a plain string into the managed
+// object form `{ type: "plain", value: "..." }` (secret refs become
+// `{ type: "secret_ref", ... }`). The raw (unresolved) agent object is handed to
+// the adapter, which Object.assign()s that env onto the child process verbatim,
+// so a static `PAPERCLIP_API_KEY` reaches the agent as `[object Object]` instead
+// of the key string → every Paperclip API call 401s ("API key not set"). It also
+// defeats the `typeof env.PAPERCLIP_API_KEY === "string"` auth-key guard below.
+//
+// Flatten the managed `{ type: "plain", value }` form back to its string here,
+// before both the auth-key guard and the child-env build, so a board-set static
+// key authenticates exactly as a plain string did pre-2026.609.0. `secret_ref`
+// values are left untouched (resolved upstream by the secrets service); only the
+// plain form is unwrapped.
+function flattenManagedEnvValue(value: unknown): unknown {
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { type?: unknown }).type === "plain" &&
+    typeof (value as { value?: unknown }).value === "string"
+  ) {
+    return (value as { value: string }).value;
+  }
+  return value;
+}
+
+function flattenManagedEnv(env: unknown): unknown {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return env;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(env as Record<string, unknown>)) {
+    out[key] = flattenManagedEnvValue(value);
+  }
+  return out;
+}
+
 function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(ctx: T): T {
   const config =
     ctx && typeof ctx === "object" && "config" in ctx && ctx.config && typeof ctx.config === "object"
@@ -209,6 +246,18 @@ function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(
   }
   if (agentAdapterConfig && !agentAdapterConfig.hermesCommand && agentCommand) {
     agentAdapterConfig.hermesCommand = agentCommand;
+  }
+
+  // TON-2279: unwrap managed env objects ({ type: "plain", value }) into plain
+  // strings on both the runtime config and the raw agent config, so a static
+  // PAPERCLIP_API_KEY survives as a usable string on every downstream path (the
+  // auth-key guard below, the JWT-fallback early return, and the child env that
+  // the hermes adapter Object.assign()s verbatim).
+  if (agentAdapterConfig && agentAdapterConfig.env && typeof agentAdapterConfig.env === "object") {
+    agentAdapterConfig.env = flattenManagedEnv(agentAdapterConfig.env);
+  }
+  if (config && config.env && typeof config.env === "object") {
+    config.env = flattenManagedEnv(config.env);
   }
 
   return ctx;
