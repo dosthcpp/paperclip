@@ -98,6 +98,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { recoveryActionEvidenceHasLoopBreaker } from "../services/recovery/loop-breaker.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -1083,6 +1084,13 @@ export function issueRoutes(
         ? await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id)
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
+
+    // TON-2299: a loop-breaker recovery action is terminal. Never auto-resolve it via
+    // `source_revalidation` — that auto-cancel is exactly what let the issue bounce
+    // forever. It stays pinned until a human/board resolves it explicitly.
+    if (recoveryActionEvidenceHasLoopBreaker(activeRecoveryAction.evidence)) {
+      return activeRecoveryAction;
+    }
 
     const resolutionNote = await classifySourceRecoveryRevalidation(input);
     if (!resolutionNote) return activeRecoveryAction;
