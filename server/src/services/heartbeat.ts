@@ -64,6 +64,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { priceCents } from "./model-pricing.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -6976,9 +6977,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
-    const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
+    const billedCostCents = normalizeBilledCostCents(result.costUsd, billingType);
     const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
     const provider = result.provider ?? "unknown";
+    // When the adapter reports no real metered cost (every subscription_included event
+    // and every OpenAI metered event with no costUsd), impute notional list-price spend
+    // from the tracked token counts so spend aggregates are non-zero (TON-2609/TON-2611).
+    // Keeps the real costUsd path intact for metered adapters that DO report cost.
+    const additionalCostCents = billedCostCents > 0
+      ? billedCostCents
+      : priceCents({
+          provider,
+          model: result.model ?? "unknown",
+          inputTokens,
+          cachedInputTokens,
+          outputTokens,
+        });
     const biller = resolveLedgerBiller(result);
     const ledgerScope = await resolveLedgerScopeForRun(db, agent.companyId, run);
 
