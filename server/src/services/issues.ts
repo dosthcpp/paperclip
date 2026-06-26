@@ -76,6 +76,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
+import { resolveCreatedByRunId } from "./run-id.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
@@ -6101,23 +6102,10 @@ export function issueService(db: Db) {
       // clean result. Demote any run-id we cannot resolve to NULL so a status
       // comment is never lost to a bad run-id — preserving the audit trail over
       // hard rejection.
-      let createdByRunId = actor.runId ?? null;
-      if (createdByRunId) {
-        const runExists = isUuidLike(createdByRunId)
-          ? await dbOrTx
-              .select({ id: heartbeatRuns.id })
-              .from(heartbeatRuns)
-              .where(eq(heartbeatRuns.id, createdByRunId))
-              .then((rows: Array<{ id: string }>) => rows[0] ?? null)
-          : null;
-        if (!runExists) {
-          logger.warn(
-            { issueId, runId: createdByRunId },
-            "addComment: unknown or malformed createdByRunId; demoting to NULL to avoid FK 500",
-          );
-          createdByRunId = null;
-        }
-      }
+      const createdByRunId = await resolveCreatedByRunId(dbOrTx, actor.runId, {
+        scope: "addComment",
+        issueId,
+      });
       const [comment] = await dbOrTx
         .insert(issueComments)
         .values({
