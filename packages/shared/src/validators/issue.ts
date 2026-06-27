@@ -24,10 +24,13 @@ import {
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_THREAD_INTERACTION_KINDS,
   ISSUE_THREAD_INTERACTION_STATUSES,
+  ISSUE_WATCHDOG_DISCOVERY_KINDS,
   MODEL_PROFILE_KEYS,
+  REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
 } from "../constants.js";
 import { SOLICIT_BID_WEIGHTS_PRESETS } from "../solicit-bid-award.js";
 import { multilineTextSchema } from "./text.js";
+import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -198,6 +201,8 @@ export const issueExecutionPolicySchema = z.object({
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
+  reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
+  authorizationPolicy: trustAuthorizationPolicySchema.optional(),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -391,6 +396,14 @@ const createIssueBaseSchema = z.object({
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
   labelIds: z.array(z.string().uuid()).optional(),
+  watchdogDiscovery: z.object({
+    kind: z.enum(ISSUE_WATCHDOG_DISCOVERY_KINDS),
+    evidenceMarkdown: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
+  watchdog: z.object({
+    agentId: z.string().uuid(),
+    instructions: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
 });
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
@@ -401,10 +414,18 @@ export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSch
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
+export const upsertIssueWatchdogSchema = z.object({
+  agentId: z.string().uuid(),
+  instructions: multilineTextSchema.optional().nullable(),
+}).strict();
+
+export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
+
 export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema
   .omit({
     parentId: true,
     inheritExecutionWorkspaceFromIssueId: true,
+    watchdogDiscovery: true,
   })
   .extend({
     acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
@@ -427,7 +448,7 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueBaseSchema.partial().extend({
+export const updateIssueSchema = createIssueBaseSchema.omit({ watchdog: true }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
@@ -667,6 +688,7 @@ export const askUserQuestionsPayloadSchema = z.object({
 export const askUserQuestionsAnswerSchema = z.object({
   questionId: z.string().trim().min(1).max(120),
   optionIds: z.array(z.string().trim().min(1).max(120)).max(20),
+  otherText: multilineTextSchema.pipe(z.string().trim().max(4000)).nullable().optional(),
 });
 
 export const askUserQuestionsResultSchema = z.object({
@@ -678,11 +700,10 @@ export const askUserQuestionsResultSchema = z.object({
 });
 
 const requestConfirmationHrefSchema = z.string().trim().min(1).max(2000).refine((value) => {
-  const lower = value.toLowerCase();
-  return !lower.startsWith("javascript:")
-    && !lower.startsWith("data:")
-    && !value.startsWith("//");
-}, "href must not use javascript:, data:, or protocol-relative URLs");
+  if (value.startsWith("#")) return true;
+  if (value.startsWith("/")) return !value.startsWith("//");
+  return /^https?:\/\//i.test(value);
+}, "href must be a root-relative path, same-page fragment, or http(s) URL");
 
 const requestConfirmationTargetBaseSchema = z.object({
   label: z.string().trim().min(1).max(120).nullable().optional(),
@@ -722,6 +743,106 @@ export const requestConfirmationPayloadSchema = z.object({
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
+});
+
+export const requestCheckboxConfirmationOptionSchema = z.object({
+  id: z.string().trim().min(1).max(120),
+  label: z.string().trim().min(1).max(120),
+  description: z.string().trim().max(500).nullable().optional(),
+});
+
+export const requestCheckboxConfirmationPayloadSchema = z.object({
+  version: z.literal(1),
+  prompt: z.string().trim().min(1).max(1000),
+  detailsMarkdown: z.string().max(20000).nullable().optional(),
+  options: z.array(requestCheckboxConfirmationOptionSchema)
+    .min(1)
+    .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT),
+  defaultSelectedOptionIds: z.array(z.string().trim().min(1).max(120))
+    .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
+    .optional()
+    .default([]),
+  minSelected: z.number().int().min(0).optional().default(0),
+  maxSelected: z.number().int().min(0).nullable().optional(),
+  acceptLabel: z.string().trim().min(1).max(80).nullable().optional(),
+  rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),
+  rejectRequiresReason: z.boolean().optional(),
+  rejectReasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
+  allowDeclineReason: z.boolean().optional().default(true),
+  declineReasonPlaceholder: z.string().trim().min(1).max(240).nullable().optional(),
+  supersedeOnUserComment: z.boolean().optional(),
+  target: requestConfirmationTargetSchema.nullable().optional(),
+}).superRefine((value, ctx) => {
+  const optionIds = new Set<string>();
+  for (const [index, option] of value.options.entries()) {
+    if (optionIds.has(option.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Option ids must be unique within one checkbox confirmation",
+        path: ["options", index, "id"],
+      });
+    }
+    optionIds.add(option.id);
+  }
+
+  const defaultSelectedOptionIds = new Set<string>();
+  for (const [index, optionId] of value.defaultSelectedOptionIds.entries()) {
+    if (defaultSelectedOptionIds.has(optionId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "defaultSelectedOptionIds must be unique",
+        path: ["defaultSelectedOptionIds", index],
+      });
+      continue;
+    }
+    defaultSelectedOptionIds.add(optionId);
+    if (!optionIds.has(optionId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "defaultSelectedOptionIds must reference existing option ids",
+        path: ["defaultSelectedOptionIds", index],
+      });
+    }
+  }
+
+  const maxSelected = value.maxSelected ?? null;
+  if (value.minSelected > value.options.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "minSelected cannot exceed the option count",
+      path: ["minSelected"],
+    });
+  }
+  if (value.defaultSelectedOptionIds.length < value.minSelected) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "defaultSelectedOptionIds must satisfy minSelected",
+      path: ["defaultSelectedOptionIds"],
+    });
+  }
+  if (maxSelected != null) {
+    if (maxSelected < value.minSelected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "maxSelected must be greater than or equal to minSelected",
+        path: ["maxSelected"],
+      });
+    }
+    if (maxSelected > value.options.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "maxSelected cannot exceed the option count",
+        path: ["maxSelected"],
+      });
+    }
+    if (value.defaultSelectedOptionIds.length > maxSelected) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "defaultSelectedOptionIds cannot exceed maxSelected",
+        path: ["defaultSelectedOptionIds"],
+      });
+    }
+  }
 });
 
 export const requestConfirmationResultSchema = z.object({
@@ -802,6 +923,25 @@ export const solicitBidResultSchema = z.object({
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
 });
 
+export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
+  selectedOptionIds: z.array(z.string().trim().min(1).max(120))
+    .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
+    .optional(),
+}).superRefine((value, ctx) => {
+  const selectedOptionIds = value.selectedOptionIds ?? [];
+  const seenOptionIds = new Set<string>();
+  for (const [index, optionId] of selectedOptionIds.entries()) {
+    if (seenOptionIds.has(optionId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "selectedOptionIds must be unique",
+        path: ["selectedOptionIds", index],
+      });
+    }
+    seenOptionIds.add(optionId);
+  }
+});
+
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("suggest_tasks"),
@@ -843,12 +983,25 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_candidates"),
     payload: solicitBidPayloadSchema,
   }),
+  z.object({
+    kind: z.literal("request_checkbox_confirmation"),
+    idempotencyKey: z.string().trim().max(255).nullable().optional(),
+    sourceCommentId: z.string().uuid().nullable().optional(),
+    sourceRunId: z.string().uuid().nullable().optional(),
+    title: z.string().trim().max(240).nullable().optional(),
+    summary: z.string().trim().max(1000).nullable().optional(),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+    payload: requestCheckboxConfirmationPayloadSchema,
+  }),
 ]);
 
 export type CreateIssueThreadInteraction = z.infer<typeof createIssueThreadInteractionSchema>;
 
 export const acceptIssueThreadInteractionSchema = z.object({
   selectedClientKeys: z.array(z.string().trim().min(1).max(120)).min(1).max(50).optional(),
+  selectedOptionIds: z.array(z.string().trim().min(1).max(120))
+    .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
+    .optional(),
 }).superRefine((value, ctx) => {
   const seenClientKeys = new Set<string>();
   for (const [index, clientKey] of (value.selectedClientKeys ?? []).entries()) {
@@ -861,6 +1014,19 @@ export const acceptIssueThreadInteractionSchema = z.object({
       continue;
     }
     seenClientKeys.add(clientKey);
+  }
+
+  const seenOptionIds = new Set<string>();
+  for (const [index, optionId] of (value.selectedOptionIds ?? []).entries()) {
+    if (seenOptionIds.has(optionId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "selectedOptionIds must be unique",
+        path: ["selectedOptionIds", index],
+      });
+      continue;
+    }
+    seenOptionIds.add(optionId);
   }
 });
 export type AcceptIssueThreadInteraction = z.infer<typeof acceptIssueThreadInteractionSchema>;

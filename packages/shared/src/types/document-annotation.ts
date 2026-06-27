@@ -55,7 +55,8 @@ export interface DocumentAnnotationAnchorSnapshot {
 export interface DocumentAnnotationThread {
   id: string;
   companyId: string;
-  issueId: string;
+  issueId: string | null;
+  routineId?: string | null;
   documentId: string;
   documentKey: string;
   status: DocumentAnnotationThreadStatus;
@@ -86,13 +87,15 @@ export interface DocumentAnnotationComment {
   id: string;
   companyId: string;
   threadId: string;
-  issueId: string;
+  issueId: string | null;
+  routineId?: string | null;
   documentId: string;
   body: string;
   authorType: IssueCommentAuthorType;
   authorAgentId: string | null;
   authorUserId: string | null;
   createdByRunId: string | null;
+  issueCommentId?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -123,10 +126,12 @@ export interface CreateDocumentAnnotationThreadRequest {
   baseRevisionNumber: number;
   selector: DocumentAnnotationAnchorSelector;
   body: string;
+  issueCommentId?: string | null;
 }
 
 export interface CreateDocumentAnnotationCommentRequest {
   body: string;
+  issueCommentId?: string | null;
 }
 
 export interface UpdateDocumentAnnotationThreadRequest {

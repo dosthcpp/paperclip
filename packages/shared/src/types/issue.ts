@@ -30,6 +30,11 @@ import type { Goal } from "./goal.js";
 import type { Project, ProjectWorkspace } from "./project.js";
 import type { ExecutionWorkspace, IssueExecutionWorkspaceSettings } from "./workspace-runtime.js";
 import type { IssueWorkProduct } from "./work-product.js";
+import type {
+  LowTrustReviewPresetPolicy,
+  SourceTrustMetadata,
+  TrustAuthorizationPolicy,
+} from "../trust-policy.js";
 
 export type { IssueWorkMode };
 
@@ -99,6 +104,7 @@ export interface IssueDocumentSummary {
   lockedAt: Date | null;
   lockedByAgentId: string | null;
   lockedByUserId: string | null;
+  sourceTrust?: SourceTrustMetadata | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -441,6 +447,8 @@ export interface IssueExecutionPolicy {
   commentRequired: boolean;
   stages: IssueExecutionStage[];
   monitor?: IssueExecutionMonitorPolicy | null;
+  reviewPreset?: LowTrustReviewPresetPolicy;
+  authorizationPolicy?: TrustAuthorizationPolicy;
 }
 
 export interface IssueExecutionMonitorState {
@@ -493,6 +501,34 @@ export interface IssueExecutionDecision {
   updatedAt: Date;
 }
 
+export type IssueWatchdogStatus = "active" | "disabled";
+
+export interface IssueWatchdogSummary {
+  id: string;
+  companyId: string;
+  issueId: string;
+  watchdogAgentId: string;
+  instructions: string | null;
+  status: IssueWatchdogStatus;
+  watchdogIssueId: string | null;
+  lastObservedFingerprint: string | null;
+  lastReviewedFingerprint: string | null;
+  lastTriggeredAt: Date | null;
+  lastCompletedAt: Date | null;
+  triggerCount: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IssueWatchdog extends IssueWatchdogSummary {
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
+  createdByRunId: string | null;
+  updatedByAgentId: string | null;
+  updatedByUserId: string | null;
+  updatedByRunId: string | null;
+}
+
 export interface Issue {
   id: string;
   companyId: string;
@@ -537,6 +573,7 @@ export interface Issue {
   completedAt: Date | null;
   cancelledAt: Date | null;
   hiddenAt: Date | null;
+  sourceTrust?: SourceTrustMetadata | null;
   labelIds?: string[];
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
@@ -546,6 +583,7 @@ export interface Issue {
   productivityReview?: IssueProductivityReview | null;
   activeRecoveryAction?: IssueRecoveryAction | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
+  watchdog?: IssueWatchdogSummary | null;
   scheduledRetry?: IssueScheduledRetry | null;
   relatedWork?: IssueRelatedWorkSummary;
   referencedIssueIdentifiers?: string[];
@@ -579,6 +617,12 @@ export interface IssueComment {
   body: string;
   presentation: IssueCommentPresentation | null;
   metadata: IssueCommentMetadata | null;
+  deletedAt?: Date | null;
+  deletedByType?: "agent" | "user" | null;
+  deletedByAgentId?: string | null;
+  deletedByUserId?: string | null;
+  deletedByRunId?: string | null;
+  sourceTrust?: SourceTrustMetadata | null;
   followUpRequested?: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -722,6 +766,7 @@ export interface AskUserQuestionsPayload {
 export interface AskUserQuestionsAnswer {
   questionId: string;
   optionIds: string[];
+  otherText?: string | null;
 }
 
 export interface AskUserQuestionsResult {
@@ -766,6 +811,30 @@ export interface RequestConfirmationPayload {
   allowDeclineReason?: boolean;
   declineReasonPlaceholder?: string | null;
   detailsMarkdown?: string | null;
+  supersedeOnUserComment?: boolean;
+  target?: RequestConfirmationTarget | null;
+}
+
+export interface RequestCheckboxConfirmationOption {
+  id: string;
+  label: string;
+  description?: string | null;
+}
+
+export interface RequestCheckboxConfirmationPayload {
+  version: 1;
+  prompt: string;
+  detailsMarkdown?: string | null;
+  options: RequestCheckboxConfirmationOption[];
+  defaultSelectedOptionIds?: string[];
+  minSelected?: number;
+  maxSelected?: number | null;
+  acceptLabel?: string | null;
+  rejectLabel?: string | null;
+  rejectRequiresReason?: boolean;
+  rejectReasonLabel?: string | null;
+  allowDeclineReason?: boolean;
+  declineReasonPlaceholder?: string | null;
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
 }
@@ -821,6 +890,10 @@ export interface SolicitBidResult {
   cancellationReason?: string | null;
 }
 
+export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {
+  selectedOptionIds?: string[];
+}
+
 export interface IssueThreadInteractionBase extends IssueThreadInteractionActorFields {
   id: string;
   companyId: string;
@@ -862,23 +935,32 @@ export interface SolicitBidInteraction extends IssueThreadInteractionBase {
   result?: SolicitBidResult | null;
 }
 
+export interface RequestCheckboxConfirmationInteraction extends IssueThreadInteractionBase {
+  kind: "request_checkbox_confirmation";
+  payload: RequestCheckboxConfirmationPayload;
+  result?: RequestCheckboxConfirmationResult | null;
+}
+
 export type IssueThreadInteraction =
   | SuggestTasksInteraction
   | AskUserQuestionsInteraction
   | RequestConfirmationInteraction
-  | SolicitBidInteraction;
+  | SolicitBidInteraction
+  | RequestCheckboxConfirmationInteraction;
 
 export type IssueThreadInteractionPayload =
   | SuggestTasksPayload
   | AskUserQuestionsPayload
   | RequestConfirmationPayload
-  | SolicitBidPayload;
+  | SolicitBidPayload
+  | RequestCheckboxConfirmationPayload;
 
 export type IssueThreadInteractionResult =
   | SuggestTasksResult
   | AskUserQuestionsResult
   | RequestConfirmationResult
-  | SolicitBidResult;
+  | SolicitBidResult
+  | RequestCheckboxConfirmationResult;
 
 export interface IssueAttachment {
   id: string;
