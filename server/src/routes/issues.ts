@@ -4205,18 +4205,12 @@ export function issueRoutes(
       return;
     }
     const favorite = await svc.addFavorite(issue.companyId, issue.id, req.actor.userId, new Date());
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.favorited",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId, favoritedAt: favorite?.favoritedAt },
-    });
+    // Favorites are private per-user bookmarks. Do NOT call logActivity here:
+    // it persists to company-scoped activity_log AND broadcasts a live
+    // `activity.logged` event to every member of the company, leaking which
+    // issues a given user bookmarks. The favorites table already records the
+    // per-user state. (TON-2674: greptile P1 — favorite events visible to the
+    // whole company.)
     res.json({ id: issue.id, favorited: true, favoritedAt: favorite?.favoritedAt ?? null });
   });
 
@@ -4237,18 +4231,8 @@ export function issueRoutes(
       return;
     }
     const removed = await svc.removeFavorite(issue.companyId, issue.id, req.actor.userId);
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.unfavorited",
-      entityType: "issue",
-      entityId: issue.id,
-      details: { userId: req.actor.userId },
-    });
+    // Private per-user state — no company-wide activity event (see the matching
+    // note in POST /issues/:id/favorite above; TON-2674 greptile P1).
     res.json({ id: issue.id, favorited: false, removed });
   });
 
