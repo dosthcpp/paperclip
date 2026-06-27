@@ -57,7 +57,7 @@ export function pushRoutes(db: Db) {
     const userId = requireBoardUserId(req, res);
     if (!userId) return;
 
-    await store.removeByEndpoint(req.body.endpoint);
+    await store.removeByEndpointForUser(userId, req.body.endpoint);
     res.json({ ok: true });
   });
 

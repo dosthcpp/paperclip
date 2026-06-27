@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { buildActivityNotification } from "../services/push-triggers.js";
-import { pruneEndpoints, upsertSubscription, type StoredPushSubscription } from "../services/push-subscription-store.js";
+import {
+  pruneEndpoints,
+  pruneOwnedEndpoint,
+  pushSubscriptionStore,
+  upsertSubscription,
+  type StoredPushSubscription,
+} from "../services/push-subscription-store.js";
 import {
   __resetPushConfigForTests,
   getVapidPublicKey,
@@ -91,6 +97,76 @@ describe("subscription store pure helpers", () => {
       "https://push/3",
     ]);
     expect(pruneEndpoints(list, [])).toHaveLength(3);
+  });
+
+  it("pruneOwnedEndpoint removes only the caller's own matching subscription", () => {
+    const list = [sub("https://push/1", "u1"), sub("https://push/1", "u2"), sub("https://push/2", "u1")];
+    const out = pruneOwnedEndpoint(list, "u1", "https://push/1");
+    // u1's row for that endpoint is gone; u2's identical endpoint survives.
+    expect(out).toHaveLength(2);
+    expect(out.find((s) => s.endpoint === "https://push/1")?.userId).toBe("u2");
+    expect(out.some((s) => s.endpoint === "https://push/2" && s.userId === "u1")).toBe(true);
+    // A user who doesn't own the endpoint cannot delete it (no-op).
+    expect(pruneOwnedEndpoint(list, "u3", "https://push/1")).toHaveLength(3);
+  });
+});
+
+/**
+ * Reproduces the read-modify-write race (TON-2674 greptile P1). A fake Db with
+ * artificial latency forces two concurrent mutations to interleave; with the
+ * per-key mutex in place neither update is lost.
+ */
+describe("subscription store serializes concurrent mutations", () => {
+  const sub = (endpoint: string, userId: string): StoredPushSubscription => ({
+    userId,
+    endpoint,
+    keys: { p256dh: "p", auth: "a" },
+    createdAt: "2026-06-27T00:00:00.000Z",
+  });
+
+  function makeFakeDb(latencyMs: number) {
+    let stored: Record<string, unknown> | null = null;
+    const wait = () => new Promise((r) => setTimeout(r, latencyMs));
+    return {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            then: (onF: (rows: unknown[]) => unknown, onR?: (e: unknown) => unknown) =>
+              wait()
+                .then(() => (stored == null ? [] : [{ general: stored }]))
+                .then(onF, onR),
+          }),
+        }),
+      }),
+      insert: () => ({
+        values: (v: { general: Record<string, unknown> }) => ({
+          onConflictDoUpdate: () =>
+            wait().then(() => {
+              stored = v.general;
+            }),
+        }),
+      }),
+    };
+  }
+
+  it("does not drop an update when two adds race", async () => {
+    const db = makeFakeDb(5) as unknown as Parameters<typeof pushSubscriptionStore>[0];
+    const store = pushSubscriptionStore(db);
+    await Promise.all([store.add(sub("https://push/A", "uA")), store.add(sub("https://push/B", "uB"))]);
+    const endpoints = (await store.list()).map((s) => s.endpoint).sort();
+    expect(endpoints).toEqual(["https://push/A", "https://push/B"]);
+  });
+
+  it("owner-scoped removal races safely against a concurrent add", async () => {
+    const db = makeFakeDb(5) as unknown as Parameters<typeof pushSubscriptionStore>[0];
+    const store = pushSubscriptionStore(db);
+    await store.add(sub("https://push/keep", "u1"));
+    await Promise.all([
+      store.add(sub("https://push/new", "u2")),
+      store.removeByEndpointForUser("u1", "https://push/keep"),
+    ]);
+    const endpoints = (await store.list()).map((s) => s.endpoint);
+    expect(endpoints).toEqual(["https://push/new"]);
   });
 });
 

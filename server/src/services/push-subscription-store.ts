@@ -51,7 +51,8 @@ export function upsertSubscription(
   return [...filtered, next];
 }
 
-/** Remove every subscription whose endpoint is in `endpoints`. */
+/** Remove every subscription whose endpoint is in `endpoints` (owner-agnostic;
+ *  used to prune endpoints the push service reported as expired/gone). */
 export function pruneEndpoints(
   list: readonly StoredPushSubscription[],
   endpoints: readonly string[],
@@ -59,6 +60,20 @@ export function pruneEndpoints(
   if (endpoints.length === 0) return [...list];
   const drop = new Set(endpoints);
   return list.filter((s) => !drop.has(s.endpoint));
+}
+
+/**
+ * Remove the subscription matching BOTH `endpoint` AND `userId`. Used by the
+ * user-initiated unsubscribe path so a board user can only delete their own
+ * device subscription — not an arbitrary first row that happens to share the
+ * endpoint (TON-2674: greptile P1, unsubscribe ownership not verified).
+ */
+export function pruneOwnedEndpoint(
+  list: readonly StoredPushSubscription[],
+  userId: string,
+  endpoint: string,
+): StoredPushSubscription[] {
+  return list.filter((s) => !(s.endpoint === endpoint && s.userId === userId));
 }
 
 function normalizeBlob(raw: unknown): WebPushSettingsBlob {
@@ -76,6 +91,37 @@ function normalizeBlob(raw: unknown): WebPushSettingsBlob {
       typeof (s as StoredPushSubscription).keys.auth === "string",
   );
   return { subscriptions: valid };
+}
+
+// --- Mutation serialization ----------------------------------------------
+
+/**
+ * The whole subscription list lives in a single JSONB row, and every mutation
+ * is a read-modify-write (readBlob → mutate → writeBlob). Without
+ * serialization, concurrent calls interleave — readBlob(A), readBlob(B),
+ * writeBlob(A), writeBlob(B) — and B's stale snapshot clobbers A's change,
+ * silently dropping a subscription (TON-2674: greptile P1, RMW race). The
+ * server is single-process, so chaining mutations through one promise per
+ * settings key fully serializes them. (Multi-process deployments would need a
+ * row-level `SELECT … FOR UPDATE`; deferred until this graduates to a real
+ * `push_subscriptions` table — see the file header.)
+ */
+const mutationChains = new Map<string, Promise<unknown>>();
+
+function withKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = mutationChains.get(key) ?? Promise.resolve();
+  // Run `fn` after the previous mutation settles, regardless of its outcome.
+  const next = prev.then(fn, fn);
+  // Park a rejection-swallowing tail as the chain head so one failed mutation
+  // can never reject the next waiter; callers still observe their own `next`.
+  mutationChains.set(
+    key,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return next;
 }
 
 // --- DB-backed store ------------------------------------------------------
@@ -116,21 +162,32 @@ export function pushSubscriptionStore(db: Db) {
     listForUser: async (userId: string): Promise<StoredPushSubscription[]> =>
       (await readBlob()).subscriptions.filter((s) => s.userId === userId),
 
-    add: async (sub: StoredPushSubscription): Promise<void> => {
-      const blob = await readBlob();
-      await writeBlob({ subscriptions: upsertSubscription(blob.subscriptions, sub) });
-    },
+    add: async (sub: StoredPushSubscription): Promise<void> =>
+      withKeyLock(WEB_PUSH_SINGLETON_KEY, async () => {
+        const blob = await readBlob();
+        await writeBlob({ subscriptions: upsertSubscription(blob.subscriptions, sub) });
+      }),
 
-    removeByEndpoint: async (endpoint: string): Promise<void> => {
-      const blob = await readBlob();
-      await writeBlob({ subscriptions: pruneEndpoints(blob.subscriptions, [endpoint]) });
-    },
+    /**
+     * Remove a single subscription owned by `userId`. The endpoint alone is not
+     * a capability: scoping by owner prevents a board user from unsubscribing
+     * another user's device (TON-2674 greptile P1).
+     */
+    removeByEndpointForUser: async (userId: string, endpoint: string): Promise<void> =>
+      withKeyLock(WEB_PUSH_SINGLETON_KEY, async () => {
+        const blob = await readBlob();
+        await writeBlob({
+          subscriptions: pruneOwnedEndpoint(blob.subscriptions, userId, endpoint),
+        });
+      }),
 
     /** Bulk-remove endpoints (used to prune expired/gone subscriptions). */
     removeEndpoints: async (endpoints: readonly string[]): Promise<void> => {
       if (endpoints.length === 0) return;
-      const blob = await readBlob();
-      await writeBlob({ subscriptions: pruneEndpoints(blob.subscriptions, endpoints) });
+      await withKeyLock(WEB_PUSH_SINGLETON_KEY, async () => {
+        const blob = await readBlob();
+        await writeBlob({ subscriptions: pruneEndpoints(blob.subscriptions, endpoints) });
+      });
     },
   };
 }

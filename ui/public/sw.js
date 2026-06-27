@@ -30,21 +30,34 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || "/";
+  const rawUrl = (event.notification.data && event.notification.data.url) || "/";
+  // Resolve to an absolute, same-origin URL so client.url comparisons are exact.
+  const targetUrl = new URL(rawUrl, self.location.origin).href;
 
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      // Focus an existing tab and navigate it, if one is open.
-      for (const client of clientList) {
-        if ("focus" in client) {
-          client.focus();
-          if ("navigate" in client && targetUrl !== "/") {
-            client.navigate(targetUrl).catch(() => {});
-          }
-          return undefined;
-        }
+      const appClients = clientList.filter(
+        (client) => new URL(client.url).origin === self.location.origin,
+      );
+
+      // 1) A tab already on the exact target page: just focus it. Never
+      //    navigate a *different* tab when the right one is already open
+      //    (TON-2674 greptile P1: notificationclick navigated the first window
+      //    unconditionally, hijacking an unrelated tab).
+      const exact = appClients.find((client) => client.url === targetUrl);
+      if (exact && "focus" in exact) {
+        return exact.focus();
       }
-      // Otherwise open a new window.
+
+      // 2) Reuse one of our own app tabs by navigating it to the target.
+      const reusable = appClients.find((client) => "focus" in client && "navigate" in client);
+      if (reusable) {
+        return reusable.focus().then((focused) =>
+          (focused || reusable).navigate(targetUrl).catch(() => {}),
+        );
+      }
+
+      // 3) No suitable tab open: open a new window on the target.
       if (self.clients.openWindow) {
         return self.clients.openWindow(targetUrl);
       }
