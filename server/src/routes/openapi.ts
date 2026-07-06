@@ -2743,6 +2743,15 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/project-suggestions",
+  tags: ["issues"],
+  summary: "Ranked project suggestions for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/admin/force-release",
   tags: ["issues"],
