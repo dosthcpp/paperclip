@@ -38,6 +38,11 @@ vi.mock("../adapters/index.js", () => ({
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
+  findActiveServerAdapter: () => ({
+    type: "codex_local",
+    execute: adapterExecute,
+    supportsLocalAgentJwt: false,
+  }),
   listAdapterModelProfiles: async () => [],
   runningProcesses: new Map(),
 }));
@@ -108,6 +113,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       name: "Acme",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -340,6 +346,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         name: "Acme A",
         issuePrefix: `T${companyAId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         status: "active",
+        defaultResponsibleUserId: "responsible-user-a",
         createdAt: new Date(),
         updatedAt: new Date(),
       },
@@ -348,6 +355,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         name: "Acme B",
         issuePrefix: `T${companyBId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         status: "active",
+        defaultResponsibleUserId: "responsible-user-b",
         createdAt: new Date(),
         updatedAt: new Date(),
       },
@@ -508,6 +516,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       name: "Acme",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -634,6 +643,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       title: "Environment matrix: e2b / codex_local",
       status: "in_progress",
       priority: "medium",
+      responsibleUserId: "responsible-user",
       assigneeAgentId: agentId,
       executionWorkspaceId: staleExecutionWorkspaceId,
       executionWorkspaceSettings: {

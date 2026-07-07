@@ -45,7 +45,7 @@ import {
   isCodexUnknownSessionError,
 } from "./parse.js";
 import {
-  codexHomeHasUsableAuth,
+  evaluateCodexCredentialReadiness,
   isManagedCodexHomePath,
   pathExists,
   prepareManagedCodexHome,
@@ -402,12 +402,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // with OPENAI_API_KEY="" the provider rejects every request with
   // "401 Missing bearer"; fail fast with a clear adapter error instead of
   // emitting unauthenticated calls. External overrides manage their own auth.
-  const effectiveHomeIsManaged = configuredCodexHome == null || configuredHomeIsManaged;
-  if (
-    effectiveHomeIsManaged &&
-    !configuredOpenAiApiKey &&
-    !(await codexHomeHasUsableAuth(effectiveCodexHome))
-  ) {
+  // This is the execute-time backstop for the control plane's pre-dispatch
+  // configuration-incomplete gate (see server heartbeat) — both decide
+  // readiness through the same `evaluateCodexCredentialReadiness` predicate, so
+  // they cannot drift.
+  const credentialReadiness = await evaluateCodexCredentialReadiness({
+    env: process.env,
+    companyId: agent.companyId,
+    configuredCodexHome,
+    configuredApiKey: configuredOpenAiApiKey,
+  });
+  if (credentialReadiness.managed && !credentialReadiness.ready) {
     throw new Error(
       `no Codex credentials provisioned for managed home "${effectiveCodexHome}" ` +
         `(no usable auth.json and OPENAI_API_KEY is empty). ` +
@@ -464,11 +469,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             installCommand: SANDBOX_INSTALL_COMMAND,
             detectCommand: command,
             onProgress: (line) => onLog("stdout", line),
+            onRuntimeProgress: ctx.onRuntimeProgress,
             assets: [
               {
                 key: "home",
                 localDir: effectiveCodexHome,
                 followSymlinks: true,
+                // Exclude state that the sandbox run never needs so we don't
+                // tar/upload hundreds of MB on every run:
+                // - `tmp`/`.tmp`: transient dirs that can hold symlinks to the
+                //   host Codex binary (e.g. `tmp/arg0`); followSymlinks would
+                //   inline those binaries and bloat the archive.
+                // - `sessions`: prior conversation rollouts (host-local history,
+                //   typically the bulk of CODEX_HOME) — irrelevant to a fresh run.
+                // - `shell_snapshots`: host shell captures that don't apply to
+                //   the sandbox's (different) shell/OS.
+                // Auth, config, and skills (the bits Codex actually needs) are
+                // small and still uploaded.
+                exclude: ["tmp", ".tmp", "sessions", "shell_snapshots"],
               },
             ],
           });
@@ -869,6 +887,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec,
           graceSec,
           onSpawn: wrappedOnSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             if (stream === "stdout") {
               monitor?.noteStdoutChunk(chunk);
@@ -879,6 +898,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             if (!cleaned.trim()) return;
             await onLog(stream, cleaned);
           },
+          runLogTail: paperclipBridge?.runLogTail,
         });
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
