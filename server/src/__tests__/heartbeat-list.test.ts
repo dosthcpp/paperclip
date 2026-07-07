@@ -143,17 +143,17 @@ describeEmbeddedPostgres("heartbeat list", () => {
 
     const service = heartbeatService(db);
 
-    const page1 = await service.list(companyId, agentId, 2, 0);
+    const page1 = await service.list(companyId, agentId, 2, { offset: 0 });
     expect(page1.map((r) => r.id)).toEqual(newestFirst.slice(0, 2));
 
-    const page2 = await service.list(companyId, agentId, 2, 2);
+    const page2 = await service.list(companyId, agentId, 2, { offset: 2 });
     expect(page2.map((r) => r.id)).toEqual(newestFirst.slice(2, 4));
 
-    const page3 = await service.list(companyId, agentId, 2, 4);
+    const page3 = await service.list(companyId, agentId, 2, { offset: 4 });
     expect(page3.map((r) => r.id)).toEqual(newestFirst.slice(4, 5));
 
     // Offset beyond the end yields an empty page (pagination terminates).
-    const page4 = await service.list(companyId, agentId, 2, 6);
+    const page4 = await service.list(companyId, agentId, 2, { offset: 6 });
     expect(page4).toHaveLength(0);
 
     // No limit still returns the full ordered list (backward compatible).
