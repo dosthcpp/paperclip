@@ -217,6 +217,23 @@ const TOKEN_USAGE_REGEX =
 /** Regex to extract cost from Hermes output. */
 const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
 
+/**
+ * Valid Hermes session id shapes: CLI `YYYYMMDD_HHMMSS_<hex>` (e.g.
+ * `20260607_235905_41c7c7`) or ACP UUID. Anything else must NEVER reach
+ * `hermes chat --resume`: Hermes aborts with "Session not found" and returns
+ * False (no fresh-session fallback), which fails the Paperclip run and
+ * reassigns the issue. Guards two field culprits (TON-2274/TON-2287): a stray
+ * word like `from` captured by the loose legacy regex out of "session saved
+ * from <path>", and a Paperclip-side id like `20260607_235905_` (no hex
+ * suffix) that is never a valid Hermes session.
+ */
+const HERMES_SESSION_ID_REGEX =
+  /^(?:\d{8}_\d{6}_[0-9a-f]{4,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+export function isValidHermesSessionId(id: string | null | undefined): id is string {
+  return typeof id === "string" && HERMES_SESSION_ID_REGEX.test(id.trim());
+}
+
 interface ParsedOutput {
   sessionId?: string;
   response?: string;
@@ -268,17 +285,21 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
+    // Only persist a well-formed Hermes id; a malformed capture would fail
+    // the next --resume and reassign the issue (TON-2274/TON-2287).
+    result.sessionId = isValidHermesSessionId(sessionMatch[1]) ? sessionMatch[1] : null;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
       result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
     }
   } else {
-    // Legacy format (non-quiet mode)
+    // Legacy format (non-quiet mode). The legacy regex is deliberately loose
+    // and can grab a stray word (e.g. "from" out of "session saved from ..."),
+    // so the format guard is essential here (TON-2274/TON-2287).
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
+    if (legacyMatch?.[1] && isValidHermesSessionId(legacyMatch[1])) {
+      result.sessionId = legacyMatch[1];
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -444,7 +465,11 @@ export async function execute(
   // system is designed for human-attended interactive sessions.
   args.push("--yolo");
 
-  if (persistSession && prevSessionId) {
+  // Only resume a well-formed Hermes id. An invalid persisted id (stray
+  // "from", truncated "20260607_235905_") makes `--resume` abort with
+  // "Session not found" → run fails → issue reassigns. Skipping the flag
+  // cold-starts instead, which also self-heals already-corrupted state.
+  if (persistSession && isValidHermesSessionId(prevSessionId)) {
     args.push("--resume", prevSessionId);
   }
 
