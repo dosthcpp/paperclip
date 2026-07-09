@@ -287,7 +287,10 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   if (sessionMatch?.[1]) {
     // Only persist a well-formed Hermes id; a malformed capture would fail
     // the next --resume and reassign the issue (TON-2274/TON-2287).
-    result.sessionId = isValidHermesSessionId(sessionMatch[1]) ? sessionMatch[1] : null;
+    // `undefined` (not `null`) to match the optional `sessionId?: string`
+    // field; every consumer treats absent/null identically (`if (parsed.sessionId)`,
+    // `parsed.sessionId || null`), so this is wire-equivalent and tsc-clean.
+    result.sessionId = isValidHermesSessionId(sessionMatch[1]) ? sessionMatch[1] : undefined;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
