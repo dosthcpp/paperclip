@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
+  createChildIssueSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
@@ -440,6 +441,27 @@ describe("execution policy input strictness", () => {
     const result = createIssueSchema.safeParse({
       title: "Deploy watch",
       executionPolicy: { monitor: { nextCheckAt, intervalMinutes: 15 } },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a top-level monitor field on the create path too", () => {
+    const result = createIssueSchema.safeParse({
+      title: "Deploy watch",
+      monitor: { nextCheckAt },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.message.includes("executionPolicy.monitor"))).toBe(true);
+    }
+  });
+
+  it("rejects a top-level monitor field on the child-create path too", () => {
+    const result = createChildIssueSchema.safeParse({
+      title: "Deploy watch",
+      monitor: { nextCheckAt },
     });
 
     expect(result.success).toBe(false);

@@ -403,6 +403,16 @@ const createIssueBaseSchema = z.object({
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
   labelIds: z.array(z.string().uuid()).optional(),
+  // Common misplacement: monitors live under executionPolicy.monitor. Without
+  // this the key is silently stripped and create/update succeeds with no monitor.
+  // Defined on the base schema so it covers every create path
+  // (createIssueSchema, createChildIssueSchema, createIssueInputSchema) as well
+  // as updateIssueSchema, which derives from this schema.
+  monitor: z
+    .custom<never>(() => false, {
+      message: 'Unknown top-level field "monitor" — schedule issue monitors via executionPolicy.monitor',
+    })
+    .optional(),
 });
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
@@ -448,13 +458,8 @@ export const updateIssueSchema = createIssueBaseSchema.partial().extend({
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
-  // Common misplacement: monitors live under executionPolicy.monitor. Without
-  // this the key is silently stripped and the PATCH succeeds with no monitor.
-  monitor: z
-    .custom<never>(() => false, {
-      message: 'Unknown top-level field "monitor" — schedule issue monitors via executionPolicy.monitor',
-    })
-    .optional(),
+  // The top-level `monitor` misplacement trap is inherited from
+  // createIssueBaseSchema (see above), so PATCH is covered too.
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
