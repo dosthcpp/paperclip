@@ -43,6 +43,16 @@ echo "==> deploy-standalone -> $OUT_DIR (filter: $FILTER)"
 # ── Step 1: build all packages so dist/ exists ──────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
   echo "  [1/4] Building workspace packages..."
+  # Clean-safe the db package: its build does `cp -r src/migrations dist/migrations`,
+  # which is NOT idempotent. When a stale dist/migrations from a previous release
+  # persists (dist/ is gitignored and survives a branch checkout on the shared
+  # worktree), the copy NESTS into dist/migrations/migrations and the OUTER
+  # _journal.json stays stale. The runtime migrator reads the outer journal, so it
+  # silently skips every migration the new release added and the server crash-loops
+  # querying tables that were never created. (TON-2985: the 626->707 upgrade booted
+  # against a journal frozen at 0124 and died on the 0125 environment-custom-images
+  # tables.) Removing the dir before the build forces a correct, flat copy.
+  rm -rf packages/db/dist/migrations
   pnpm run preflight:workspace-links
   pnpm -r build
 else
