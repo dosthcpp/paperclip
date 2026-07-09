@@ -357,6 +357,18 @@ async function buildReferencedCatalogSkill(
 
   const files = await collectReferencedSkillFiles(source, descriptor.files ?? [SKILL_ENTRYPOINT], prefix, errors);
   const skillMarkdown = await readReferencedFileText(source, SKILL_ENTRYPOINT, prefix, errors);
+  // A transient throttle (HTTP 429/5xx) on a referenced file — not just SKILL.md —
+  // should reuse the pinned committed manifest entry rather than fail the whole
+  // build. Only reuses when the existing entry's pinned commit matches, so the
+  // manifest can never drift. (TON-2985: last30days optional skill vendors dozens
+  // of files and bursts the raw.githubusercontent rate limit on unauthenticated CI.)
+  {
+    const nextErrors = errors.slice(errorStart);
+    if (fallbackSkill && nextErrors.length > 0 && canFallbackToExistingReferencedSkill(nextErrors)) {
+      errors.splice(errorStart, nextErrors.length);
+      return fallbackSkill;
+    }
+  }
   if (!skillMarkdown) {
     const nextErrors = errors.slice(errorStart);
     if (fallbackSkill && canFallbackToExistingReferencedSkill(nextErrors)) {
