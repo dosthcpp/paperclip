@@ -61,8 +61,17 @@ else
   echo "    ui-dist copied ($(ls "$SERVER_DIR/ui-dist" | wc -l | tr -d ' ') entries)"
 fi
 
-# ── Step 3: verify bootability ──────────────────────────────────────────────────
-echo "  [3/3] Verifying bootability..."
+# ── Step 3: durable Hermes session-id guard (TON-2274/2287/2983) ────────────────
+# The fork-channel release loads the UPSTREAM published
+# @paperclipai/hermes-paperclip-adapter, which lacks our session-id --resume
+# guard; a fresh `pnpm deploy` wipes any hand-hotfix. Re-apply it here so every
+# release carries it. Idempotent (no-op if already present / adapter absent);
+# fails loudly if upstream drifted so we re-check whether the fix went upstream.
+echo "  [3/4] Applying Hermes session-id guard..."
+node "$REPO_ROOT/scripts/patch-hermes-session-id.mjs" "$TARGET"
+
+# ── Step 4: verify bootability ──────────────────────────────────────────────────
+echo "  [4/4] Verifying bootability..."
 node "$REPO_ROOT/scripts/verify-standalone-deploy.mjs" "$TARGET"
 
 echo "==> finalize-standalone-deploy: done (bootable)"
