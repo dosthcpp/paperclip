@@ -1260,6 +1260,153 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("another company");
   });
 
+  it("allows a supervisor to comment on and mutate an issue owned by a direct report", async () => {
+    const company = await createCompany(db, "ChainOfCommandDirectReport");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Report-owned issue",
+      assigneeAgentId: ctoAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: ctoAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({ actor, action: "issue:comment", resource })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+    await expect(authorization.decide({ actor, action: "issue:mutate", resource })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("extends supervisor issue writes through a transitive reporting chain", async () => {
+    const company = await createCompany(db, "ChainOfCommandTransitive");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const engineerAgent = await createAgent(db, company.id, { reportsTo: ctoAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Grandchild-owned issue",
+      assigneeAgentId: engineerAgent.id,
+    });
+
+    await expect(authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: engineerAgent.id,
+        status: issue.status,
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("keeps issue writes denied for an agent outside the reporting chain", async () => {
+    const company = await createCompany(db, "ChainOfCommandOutsider");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    // Reports to the CEO too, so it is a peer of the owner — never an ancestor.
+    const peerAgent = await createAgent(db, company.id, { reportsTo: ceoAgent.id });
+    const issue = await createIssue(db, company.id, {
+      title: "Peer-owned issue",
+      assigneeAgentId: ctoAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: peerAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: ctoAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({ actor, action: "issue:comment", resource })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+    await expect(authorization.decide({ actor, action: "issue:mutate", resource })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not let a low-trust supervisor escalate issue writes through the reporting chain", async () => {
+    const company = await createCompany(db, "ChainOfCommandLowTrust");
+    const project = await createProject(db, company.id, "LowTrustSupervisor");
+    const rootIssueId = randomUUID();
+    const lowTrustManager = await createAgent(db, company.id, {
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            projectIds: [project.id],
+            rootIssueId,
+          },
+        },
+      },
+    });
+    const reportAgent = await createAgent(db, company.id, { reportsTo: lowTrustManager.id });
+    // Inside the low-trust boundary *and* owned by a report: the reporting chain
+    // still must not widen what the trust boundary settled.
+    const insideIssue = await createIssue(db, company.id, {
+      id: rootIssueId,
+      projectId: project.id,
+      assigneeAgentId: reportAgent.id,
+    });
+    const outsideIssue = await createIssue(db, company.id, {
+      title: "Outside the low-trust boundary",
+      assigneeAgentId: reportAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: lowTrustManager.id, companyId: company.id, source: "agent_key" } as const;
+
+    const insideMutation = await authorization.decide({
+      actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: insideIssue.id,
+        projectId: project.id,
+        assigneeAgentId: reportAgent.id,
+        status: insideIssue.status,
+      },
+    });
+    expect(insideMutation.allowed).toBe(false);
+    expect(insideMutation.reason).not.toBe("allow_manager_chain");
+
+    const outsideComment = await authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: outsideIssue.id,
+        assigneeAgentId: reportAgent.id,
+        status: outsideIssue.status,
+      },
+    });
+    expect(outsideComment).toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
     const company = await createCompany(db, "ProjectScope");
     const project = await createProject(db, company.id, "Allowed");

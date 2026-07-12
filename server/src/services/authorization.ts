@@ -1580,6 +1580,24 @@ export function authorizationService(db: Db) {
       ) {
         return allowIssueMentionGrant(input.action);
       }
+      // Supervision follows the reporting chain: an agent may comment on and
+      // correct issues owned by agents that report to it, directly or
+      // transitively. Without this the only cross-owner write path is the
+      // mention-scoped grant above, which inverts supervision — the supervised
+      // agent has to grant its supervisor the right to supervise it, per issue.
+      // Low-trust actors are excluded on purpose: their boundary is settled
+      // above and must never be widened by reporting structure.
+      if (
+        !lowTrustDecision &&
+        resource?.assigneeAgentId &&
+        await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+        });
+      }
     }
     if (
       input.action === "agent_config:update" &&
