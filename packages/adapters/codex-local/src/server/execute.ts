@@ -53,6 +53,13 @@ import {
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
 } from "./codex-home.js";
+import {
+  enforceShellEnvironmentPolicyExcludes,
+  prepareSnapshotSafeZdotdir,
+  purgeShellSnapshots,
+  redactSessionRollouts,
+  stripSecretsFromShellEnvironmentPolicy,
+} from "./codex-snapshot-guard.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
@@ -437,6 +444,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
     }
+    // Codex dumps `export -p` into $CODEX_HOME/shell_snapshots/*.sh on every run.
+    // Every agent in a company runs as the same unix user, so file modes cannot keep
+    // one agent's snapshot away from another — that is the TON-2373 vector, and it
+    // survived the TON-2411/2412 hardening. The only real control is making sure a
+    // credential never reaches the dump, so strip anything credential-shaped out of
+    // the config Codex applies to shell tools and clear stale snapshots (TON-3109).
+    // Runs after prepareCodexRuntimeConfig so it scrubs the config.toml Codex will
+    // actually read, not the one it replaced.
+    await stripSecretsFromShellEnvironmentPolicy(effectiveCodexHome, onLog);
+    await purgeShellSnapshots(effectiveCodexHome);
+    // Codex records shell-tool stdout verbatim in sessions/**/rollout-*.jsonl, so an
+    // agent running `env` writes its credentials into a transcript every other agent
+    // can read — the same exposure as the snapshots, by a path the snapshot scans
+    // never covered (TON-3113). The ZDOTDIR guard below stops new ones; this clears
+    // what earlier runs already wrote. Transcripts are replayed by `codex resume`, so
+    // they are redacted in place rather than deleted, and in-flight ones are skipped.
+    await redactSessionRollouts(effectiveCodexHome).catch(() => ({
+      filesRedacted: 0,
+      secretsRedacted: 0,
+      skippedInFlight: 0,
+    }));
     // Inject skills into the same CODEX_HOME that Codex will actually run with
     // (managed home in the default case, or an explicit override from adapter config).
     const codexSkillsDir = resolveCodexSkillsDir(effectiveCodexHome);
@@ -585,6 +613,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
     }
     env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
+    if (!executionTargetIsRemote) {
+      // Codex's snapshot shell sources $ZDOTDIR/.zshrc, falling back to ~/.zshrc —
+      // which exports live credentials and so re-creates them inside the snapshot
+      // even when the process env is clean. Point it at a managed rc that still
+      // loads the user's rc (agents need its PATH and functions) but unexports
+      // credential-shaped values before Codex reaches its `export -p` (TON-3109).
+      env.ZDOTDIR = await prepareSnapshotSafeZdotdir(effectiveCodexHome);
+    }
     if (!hasExplicitApiKey && authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
@@ -607,6 +643,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+    // Codex runs shell tools in a non-interactive login shell, which reads ~/.zshenv
+    // but never ~/.zshrc — so no rc-based unset can reach them. They see credentials
+    // simply because Codex inherits them from this process and passes them down, and
+    // an agent that runs `env` then prints them into the session transcript
+    // (TON-3113). Excluding them from Codex's shell-tool env is the control that
+    // actually applies; Codex itself keeps the key it needs for the model API.
+    // Computed from the env Codex will really get, so it must follow effectiveEnv.
+    if (!executionTargetIsRemote) {
+      await enforceShellEnvironmentPolicyExcludes(effectiveCodexHome, effectiveEnv, onLog);
+    }
     const billingType = resolveCodexBillingType(effectiveEnv);
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv(effectiveEnv)).filter(
@@ -1077,6 +1123,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial, false, false);
     } finally {
+      // Belt-and-braces for TON-3109: even with the env and config scrubbed, a
+      // future Codex build could dump something new here. Codex rewrites whatever
+      // snapshot it needs at session start, so clearing them is safe for the next
+      // run and keeps a snapshot from outliving the run that produced it.
+      await purgeShellSnapshots(effectiveCodexHome).catch(() => {});
       if (paperclipBridge) {
         await paperclipBridge.stop();
       }
