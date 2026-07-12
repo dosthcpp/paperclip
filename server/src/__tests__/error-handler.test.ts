@@ -122,3 +122,92 @@ describe("errorHandler", () => {
     });
   });
 });
+
+// TON-3096: release bundles install a physically separate copy of zod under
+// @paperclipai/shared, so schemas defined there throw a ZodError whose class is
+// NOT the one this module imports. `instanceof` missed it and every validation
+// failure surfaced as 500 "Internal server error" — which is why an empty
+// comment body read as a platform outage and stranded a finished manuscript.
+describe("errorHandler — ZodError from a duplicate zod install", () => {
+  beforeEach(() => {
+    recordResponsibleUserDenialOnActiveRunMock.mockReset();
+    recordResponsibleUserDenialOnActiveRunMock.mockResolvedValue(null);
+  });
+
+  /** A ZodError class identity the server's `instanceof` cannot see. */
+  class ForeignZodError extends Error {
+    issues: unknown[];
+    errors: unknown[];
+    constructor(issues: unknown[]) {
+      super(JSON.stringify(issues));
+      this.name = "ZodError";
+      this.issues = issues;
+      this.errors = issues;
+    }
+  }
+
+  const missingBodyIssue = {
+    code: "invalid_type",
+    expected: "string",
+    received: "undefined",
+    path: ["body"],
+    message: "Required",
+  };
+
+  it("returns 400 for a foreign ZodError exposing .issues (zod v4 shape)", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new ForeignZodError([missingBodyIssue]);
+    delete (err as Partial<ForeignZodError>).errors;
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Validation error",
+      details: [missingBodyIssue],
+    });
+  });
+
+  it("returns 400 for a foreign ZodError exposing .errors (zod v3 shape)", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new ForeignZodError([missingBodyIssue]);
+    delete (err as Partial<ForeignZodError>).issues;
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Validation error",
+      details: [missingBodyIssue],
+    });
+  });
+
+  it("still returns 500 for a genuine server error", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new Error("connection terminated unexpectedly");
+    err.name = "PostgresError";
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
+  });
+
+  it("does not mistake a non-zod error that merely lacks issues for validation", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new Error("weird");
+    err.name = "ZodError";
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+  });
+});

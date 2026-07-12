@@ -68,6 +68,29 @@ function recordResponsibleUserDenialFromHttpError(
   });
 }
 
+/**
+ * Recognise a request-validation failure without relying on class identity.
+ *
+ * `instanceof ZodError` only holds when the throwing schema was built by the
+ * *same* zod module instance this file imports. Release bundles install a
+ * separate physical copy of zod under `@paperclipai/shared` and another under
+ * `@paperclipai/server`, so every schema defined in `shared` (which is most of
+ * them) throws a ZodError the server's `instanceof` cannot see. The result was
+ * silent: a malformed or empty request body fell through to the generic branch
+ * and was reported as `500 Internal server error` instead of `400 Validation
+ * error`, telling callers the server was broken when their payload was.
+ *
+ * Match structurally so any zod copy — v3 (`.errors`) or v4 (`.issues`) — maps
+ * to a 400.
+ */
+function zodValidationIssues(err: unknown): unknown[] | null {
+  if (err instanceof ZodError) return err.errors;
+  if (!(err instanceof Error) || err.name !== "ZodError") return null;
+  const candidate = err as unknown as { issues?: unknown; errors?: unknown };
+  const issues = candidate.issues ?? candidate.errors;
+  return Array.isArray(issues) ? issues : null;
+}
+
 export function errorHandler(
   err: unknown,
   req: Request,
@@ -97,8 +120,9 @@ export function errorHandler(
     return;
   }
 
-  if (err instanceof ZodError) {
-    res.status(400).json({ error: "Validation error", details: err.errors });
+  const zodIssues = zodValidationIssues(err);
+  if (zodIssues) {
+    res.status(400).json({ error: "Validation error", details: zodIssues });
     return;
   }
 
