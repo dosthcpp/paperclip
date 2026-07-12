@@ -1346,6 +1346,50 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("denies issue writes aimed up the reporting chain", async () => {
+    const company = await createCompany(db, "ChainOfCommandUpward");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const ctoAgent = await createAgent(db, company.id, { role: "cto", reportsTo: ceoAgent.id });
+    const engineerAgent = await createAgent(db, company.id, { reportsTo: ctoAgent.id });
+    const supervisorIssue = await createIssue(db, company.id, {
+      title: "Supervisor-owned issue",
+      assigneeAgentId: ctoAgent.id,
+    });
+    const skipLevelIssue = await createIssue(db, company.id, {
+      title: "Skip-level supervisor-owned issue",
+      assigneeAgentId: ceoAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    // isManagerOf(actor, assignee) walks the assignee's ancestors looking for the
+    // actor. Both parameters are bare agent ids, so a swapped call would keep every
+    // allow/peer case above green while handing reports write access to their own
+    // supervisor. Supervision is a one-way relation; pin it in both directions.
+    const actor = { type: "agent", agentId: engineerAgent.id, companyId: company.id, source: "agent_key" } as const;
+
+    for (const [issue, assigneeAgentId] of [
+      [supervisorIssue, ctoAgent.id],
+      [skipLevelIssue, ceoAgent.id],
+    ] as const) {
+      const resource = {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId,
+        status: issue.status,
+      } as const;
+
+      await expect(authorization.decide({ actor, action: "issue:comment", resource })).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+      await expect(authorization.decide({ actor, action: "issue:mutate", resource })).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+    }
+  });
+
   it("does not let a low-trust supervisor escalate issue writes through the reporting chain", async () => {
     const company = await createCompany(db, "ChainOfCommandLowTrust");
     const project = await createProject(db, company.id, "LowTrustSupervisor");

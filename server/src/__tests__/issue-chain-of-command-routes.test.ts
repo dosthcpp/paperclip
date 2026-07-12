@@ -75,6 +75,7 @@ async function seedChainOfCommandFixture(db: Db) {
 
   const [ctoIssue] = await db.insert(issues).values(issueRow("CTO-owned anchor", cto!.id)).returning();
   const [engineerIssue] = await db.insert(issues).values(issueRow("Engineer-owned task", engineer!.id)).returning();
+  const [ceoIssue] = await db.insert(issues).values(issueRow("CEO-owned directive", ceo!.id)).returning();
 
   const runFor = async (agentId: string, issueId: string) => {
     const [run] = await db.insert(heartbeatRuns).values({
@@ -88,6 +89,7 @@ async function seedChainOfCommandFixture(db: Db) {
   const ceoRun = await runFor(ceo!.id, ctoIssue!.id);
   const ctoRun = await runFor(cto!.id, ctoIssue!.id);
   const peerRun = await runFor(peer!.id, ctoIssue!.id);
+  const engineerRun = await runFor(engineer!.id, engineerIssue!.id);
 
   // The CTO holds the live checkout on its own issue — the exact state the CEO
   // was locked out of in TON-3102.
@@ -98,8 +100,8 @@ async function seedChainOfCommandFixture(db: Db) {
   return {
     company: company!,
     agents: { ceo: ceo!, cto: cto!, engineer: engineer!, peer: peer! },
-    issues: { ctoIssue: ctoIssue!, engineerIssue: engineerIssue! },
-    runs: { ceo: ceoRun, cto: ctoRun, peer: peerRun },
+    issues: { ctoIssue: ctoIssue!, engineerIssue: engineerIssue!, ceoIssue: ceoIssue! },
+    runs: { ceo: ceoRun, cto: ctoRun, peer: peerRun, engineer: engineerRun },
   };
 }
 
@@ -165,5 +167,37 @@ describeEmbeddedPostgres("chain-of-command issue write boundary (TON-3102)", () 
       .send({ status: "todo" });
     expect(patch.status, JSON.stringify(patch.body)).toBe(403);
     expect(patch.body.error).toBe("Issue is outside this actor's authorization boundary");
+  });
+
+  // The boundary is a one-way subtree walk: supervision flows down, never up. Both
+  // isManagerOf arguments are plain agent ids, so swapping them would still satisfy
+  // every allow/peer case above while silently letting reports write on their own
+  // supervisor. These pin the direction.
+  it("denies a direct report writing on their supervisor's issue", async () => {
+    const fixture = await seedChainOfCommandFixture(db);
+    const app = createApp(db, agentActor(fixture, fixture.agents.engineer.id, fixture.runs.engineer.id));
+
+    const comment = await request(app)
+      .post(`/api/issues/${fixture.issues.ctoIssue.id}/comments`)
+      .send({ body: "A report must not write on their own supervisor's issue." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(403);
+    expect(comment.body.error).toBe("Issue is outside this actor's authorization boundary");
+
+    const patch = await request(app)
+      .patch(`/api/issues/${fixture.issues.ctoIssue.id}`)
+      .send({ status: "todo" });
+    expect(patch.status, JSON.stringify(patch.body)).toBe(403);
+    expect(patch.body.error).toBe("Issue is outside this actor's authorization boundary");
+  });
+
+  it("denies a skip-level report writing up the chain", async () => {
+    const fixture = await seedChainOfCommandFixture(db);
+    const app = createApp(db, agentActor(fixture, fixture.agents.engineer.id, fixture.runs.engineer.id));
+
+    const comment = await request(app)
+      .post(`/api/issues/${fixture.issues.ceoIssue.id}/comments`)
+      .send({ body: "Supervision must not invert two levels up either." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(403);
+    expect(comment.body.error).toBe("Issue is outside this actor's authorization boundary");
   });
 });
