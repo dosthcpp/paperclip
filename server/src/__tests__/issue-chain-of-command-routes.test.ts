@@ -1,22 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import {
-  activityLog,
-  agentRuntimeState,
-  agentWakeupRequests,
-  agents,
-  companies,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueRelations,
-  issues,
-  projects,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -29,22 +16,6 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 type Db = ReturnType<typeof createDb>;
 type Fixture = Awaited<ReturnType<typeof seedChainOfCommandFixture>>;
-
-async function deleteHeartbeatRunsAfterActivityLogDrains(db: Db) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    await db.delete(activityLog);
-    try {
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  throw lastError;
-}
 
 function agentActor(fixture: Fixture, agentId: string, runId: string): Express.Request["actor"] {
   return { type: "agent", agentId, companyId: fixture.company.id, runId, source: "agent_jwt" };
@@ -132,6 +103,10 @@ async function seedChainOfCommandFixture(db: Db) {
   };
 }
 
+// Each test seeds its own company, so there is no between-test teardown: posting a comment
+// fires a fire-and-forget agent wake that keeps inserting rows (heartbeat_runs,
+// execution_workspaces, company_skills) after the request returns, and any delete sweep races
+// it into foreign-key failures. The temp database is dropped wholesale in afterAll instead.
 describeEmbeddedPostgres("chain-of-command issue write boundary (TON-3102)", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -140,18 +115,6 @@ describeEmbeddedPostgres("chain-of-command issue write boundary (TON-3102)", () 
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-chain-of-command-routes-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
-
-  afterEach(async () => {
-    await db.delete(issueComments);
-    await db.delete(issueRelations);
-    await db.delete(heartbeatRunEvents);
-    await deleteHeartbeatRunsAfterActivityLogDrains(db);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(projects);
-    await db.delete(companies);
-  });
 
   afterAll(async () => {
     await tempDb?.cleanup();
