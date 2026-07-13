@@ -19,6 +19,7 @@ const mockInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
   answerQuestions: vi.fn(),
   cancelQuestions: vi.fn(),
+  getById: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -310,6 +311,26 @@ describe.sequential("issue thread interaction routes", () => {
       createdAt: "2026-04-20T12:00:00.000Z",
       updatedAt: "2026-04-20T12:05:00.000Z",
       resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    mockInteractionService.getById.mockResolvedValue({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: "run-2",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdByUserId: null,
+      payload: {
+        version: 1,
+        prompt: "Proceed?",
+      },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
     });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
@@ -995,5 +1016,149 @@ describe.sequential("issue thread interaction routes", () => {
         userId: null,
       },
     );
+  });
+
+  it("allows an agent to cancel an interaction it created (TON-3122)", async () => {
+    mockInteractionService.cancelQuestions.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: "none",
+      payload: { version: 1, prompt: "Proceed?" },
+      result: { version: 1, outcome: "cancelled", reason: "duplicate card" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({ reason: "duplicate card" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      { reason: "duplicate card" },
+      { agentId: CREATED_AGENT_ID, userId: null },
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.thread_interaction_cancelled" }),
+    );
+  });
+
+  it("rejects an agent cancelling an interaction created by an unrelated agent (TON-3122)", async () => {
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      createdByAgentId: ASSIGNEE_AGENT_ID,
+      createdByUserId: null,
+      payload: { version: 1, prompt: "Proceed?" },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({ reason: "not mine" });
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancelQuestions).not.toHaveBeenCalled();
+  });
+
+  it("allows a reporting-chain superior to cancel a subordinate's interaction (TON-3122)", async () => {
+    const SUPERIOR_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdByUserId: null,
+      payload: { version: 1, prompt: "Proceed?" },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.cancelQuestions.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: "none",
+      payload: { version: 1, prompt: "Proceed?" },
+      result: { version: 1, outcome: "cancelled", reason: "superseded by narrower plan" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: CREATED_AGENT_ID, reportsTo: SUPERIOR_AGENT_ID },
+          { id: SUPERIOR_AGENT_ID, reportsTo: null },
+        ]).then(onFulfilled, onRejected),
+    }));
+
+    const app = await createApp({
+      type: "agent",
+      agentId: SUPERIOR_AGENT_ID,
+      companyId: "company-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({ reason: "superseded by narrower plan" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      { reason: "superseded by narrower plan" },
+      { agentId: SUPERIOR_AGENT_ID, userId: null },
+    );
+  });
+
+  it("keeps accept board-only for agent actors (TON-3122)", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/accept")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
   });
 });

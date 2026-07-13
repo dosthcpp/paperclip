@@ -702,8 +702,9 @@ export const askUserQuestionsResultSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
-  expirationReason: z.literal("superseded_by_comment").optional(),
+  expirationReason: z.enum(["superseded_by_comment", "superseded_by_replacement"]).optional(),
   commentId: z.string().uuid().nullable().optional(),
+  supersededByInteractionId: z.string().uuid().nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
 });
 
@@ -855,9 +856,17 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum([
+    "accepted",
+    "rejected",
+    "superseded_by_comment",
+    "superseded_by_replacement",
+    "stale_target",
+    "cancelled",
+  ]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
+  supersededByInteractionId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 });
 

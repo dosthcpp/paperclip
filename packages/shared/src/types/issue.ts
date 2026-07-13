@@ -962,8 +962,9 @@ export interface AskUserQuestionsResult {
   answers: AskUserQuestionsAnswer[];
   cancelled?: true;
   cancellationReason?: string | null;
-  expirationReason?: "superseded_by_comment";
+  expirationReason?: "superseded_by_comment" | "superseded_by_replacement";
   commentId?: string | null;
+  supersededByInteractionId?: string | null;
   summaryMarkdown?: string | null;
 }
 
@@ -1031,9 +1032,16 @@ export interface RequestCheckboxConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome:
+    | "accepted"
+    | "rejected"
+    | "superseded_by_comment"
+    | "superseded_by_replacement"
+    | "stale_target"
+    | "cancelled";
   reason?: string | null;
   commentId?: string | null;
+  supersededByInteractionId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
 }
 

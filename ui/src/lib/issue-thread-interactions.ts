@@ -121,9 +121,11 @@ export function buildIssueThreadInteractionSummary(
   if (interaction.kind === "request_confirmation") {
     if (interaction.status === "accepted") return "Confirmed request";
     if (interaction.status === "rejected") return "Declined request";
+    if (interaction.status === "cancelled") return "Withdrew confirmation request";
     if (interaction.status === "expired") {
       const outcome = interaction.result?.outcome;
       if (outcome === "superseded_by_comment") return "Confirmation expired after comment";
+      if (outcome === "superseded_by_replacement") return "Confirmation replaced by a newer request";
       if (outcome === "stale_target") return "Confirmation expired after target changed";
       return "Confirmation expired";
     }
@@ -140,9 +142,11 @@ export function buildIssueThreadInteractionSummary(
         : `Confirmed ${selectedCount} of ${optionCount} options`;
     }
     if (interaction.status === "rejected") return "Declined selection";
+    if (interaction.status === "cancelled") return "Withdrew selection request";
     if (interaction.status === "expired") {
       const outcome = interaction.result?.outcome;
       if (outcome === "superseded_by_comment") return "Selection expired after comment";
+      if (outcome === "superseded_by_replacement") return "Selection replaced by a newer request";
       if (outcome === "stale_target") return "Selection expired after target changed";
       return "Selection expired";
     }
@@ -161,6 +165,9 @@ export function buildIssueThreadInteractionSummary(
   if (interaction.status === "expired") {
     if (interaction.result?.expirationReason === "superseded_by_comment") {
       return count === 1 ? "Question expired after comment" : "Questions expired after comment";
+    }
+    if (interaction.result?.expirationReason === "superseded_by_replacement") {
+      return count === 1 ? "Question replaced by a newer request" : "Questions replaced by a newer request";
     }
     return count === 1 ? "Question expired" : "Questions expired";
   }

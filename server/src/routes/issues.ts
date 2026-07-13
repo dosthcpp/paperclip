@@ -151,7 +151,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationDeniedDetails, isAgentInSubtree } from "../services/authorization.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -8581,8 +8581,44 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
-      assertBoard(req);
+      if (req.actor.type === "agent") {
+        // Cancellation (retracting a card) is intentionally narrower than
+        // resolution (accept/reject), which stays board-only: an agent may
+        // withdraw a card it created, and a chain-of-command superior may
+        // withdraw cards created by agents in its reporting subtree (TON-3122).
+        if (
+          req.actor.runId &&
+          !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
+        ) {
+          return;
+        }
+        const interactionForAuthz = await issueThreadInteractionService(db).getById(interactionId);
+        if (
+          !interactionForAuthz ||
+          interactionForAuthz.issueId !== issue.id ||
+          interactionForAuthz.companyId !== issue.companyId
+        ) {
+          res.status(404).json({ error: "Interaction not found" });
+          return;
+        }
+        const actorAgentId = req.actor.agentId ?? null;
+        const creatorAgentId = interactionForAuthz.createdByAgentId ?? null;
+        const agentMayCancel = Boolean(
+          actorAgentId &&
+          creatorAgentId &&
+          (creatorAgentId === actorAgentId ||
+            (await isAgentInSubtree(db, issue.companyId, actorAgentId, creatorAgentId))),
+        );
+        if (!agentMayCancel) {
+          res.status(403).json({
+            error:
+              "Agents may cancel only issue-thread interactions created by themselves or by agents in their reporting subtree; accept/reject decisions remain board-only",
+          });
+          return;
+        }
+      } else {
+        assertBoard(req);
+      }
 
       const actor = getActorInfo(req);
       const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
@@ -8606,7 +8642,11 @@ export function issueRoutes(
           cancellationReason:
             interaction.kind === "ask_user_questions"
               ? (interaction.result?.cancellationReason ?? null)
-              : null,
+              : interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation"
+                ? (interaction.result?.reason ?? null)
+                : interaction.kind === "suggest_tasks"
+                  ? (interaction.result?.rejectionReason ?? null)
+                  : null,
         },
       });
 

@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -18,6 +18,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResult,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -230,6 +231,35 @@ function normalizeCreateInteractionInput(input: CreateIssueThreadInteraction): C
     default:
       return input;
   }
+}
+
+const VERSIONED_IDEMPOTENCY_KEY_PATTERN = /^(.+):v\d+[^:]*$/;
+
+function versionedIdempotencyKeyBase(key: string | null | undefined) {
+  if (!key) return null;
+  const match = VERSIONED_IDEMPOTENCY_KEY_PATTERN.exec(key);
+  return match ? match[1] : null;
+}
+
+function buildSupersededByReplacementResult(
+  row: IssueThreadInteractionRow,
+  supersededByInteractionId: string,
+): IssueThreadInteractionResult {
+  if (row.kind === "ask_user_questions") {
+    return {
+      version: 1,
+      answers: [],
+      expirationReason: "superseded_by_replacement",
+      supersededByInteractionId,
+      summaryMarkdown: null,
+    };
+  }
+
+  return {
+    version: 1,
+    outcome: "superseded_by_replacement",
+    supersededByInteractionId,
+  };
 }
 
 function buildSupersededByCommentResult(row: IssueThreadInteractionRow, commentId: string) {
@@ -1048,6 +1078,46 @@ export function issueThreadInteractionService(db: Db) {
         return hydrateInteraction(existing);
       }
 
+      const versionedKeyBase = versionedIdempotencyKeyBase(data.idempotencyKey);
+      if (versionedKeyBase) {
+        const candidateRows = await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "pending"),
+            inArray(issueThreadInteractions.kind, [...USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS]),
+            isNotNull(issueThreadInteractions.idempotencyKey),
+            ne(issueThreadInteractions.id, created.id),
+          ));
+
+        const now = new Date();
+        const replaced: IssueThreadInteraction[] = [];
+        for (const row of candidateRows) {
+          if (versionedIdempotencyKeyBase(row.idempotencyKey) !== versionedKeyBase) continue;
+          const [updated] = await db
+            .update(issueThreadInteractions)
+            .set({
+              status: "expired",
+              result: buildSupersededByReplacementResult(row, created.id),
+              resolvedByAgentId: actor.agentId ?? null,
+              resolvedByUserId: actor.userId ?? null,
+              resolvedAt: now,
+              updatedAt: now,
+            })
+            .where(and(
+              eq(issueThreadInteractions.id, row.id),
+              eq(issueThreadInteractions.status, "pending"),
+            ))
+            .returning();
+          if (updated) replaced.push(hydrateInteraction(updated));
+        }
+        if (replaced.length > 0) {
+          await emitResolvedInteractionsTelemetry(db, replaced);
+        }
+      }
+
       await touchIssue(db, issue.id);
       return hydrateInteraction(created);
     },
@@ -1650,25 +1720,40 @@ export function issueThreadInteractionService(db: Db) {
       if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
         throw notFound("Interaction not found");
       }
-      if (current.kind !== "ask_user_questions") {
-        throw unprocessable("Only ask_user_questions interactions can be cancelled");
-      }
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
       }
 
       const reason = data.reason?.trim() || null;
+      let cancelResult: IssueThreadInteractionResult;
+      if (current.kind === "ask_user_questions") {
+        cancelResult = {
+          version: 1,
+          answers: [],
+          cancelled: true,
+          cancellationReason: reason,
+          summaryMarkdown: null,
+        };
+      } else if (isRequestConfirmationLikeKind(current.kind)) {
+        cancelResult = {
+          version: 1,
+          outcome: "cancelled",
+          reason,
+        };
+      } else if (current.kind === "suggest_tasks") {
+        cancelResult = {
+          version: 1,
+          rejectionReason: reason,
+        };
+      } else {
+        throw unprocessable(`Interactions of kind ${current.kind} cannot be cancelled`);
+      }
+
       const [updated] = await db
         .update(issueThreadInteractions)
         .set({
           status: "cancelled",
-          result: {
-            version: 1,
-            answers: [],
-            cancelled: true,
-            cancellationReason: reason,
-            summaryMarkdown: null,
-          },
+          result: cancelResult,
           resolvedByAgentId: actor.agentId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
