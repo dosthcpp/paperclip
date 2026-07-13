@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentRuntimeState,
   agents,
   agentWakeupRequests,
   companies,
@@ -47,15 +48,6 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await fn()) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return false;
-}
-
 describeEmbeddedPostgres("heartbeat single running run per agent (TON-3196)", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -72,6 +64,7 @@ describeEmbeddedPostgres("heartbeat single running run per agent (TON-3196)", ()
     runningProcesses.clear();
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -148,9 +141,17 @@ describeEmbeddedPostgres("heartbeat single running run per agent (TON-3196)", ()
     const { companyId, agentId } = await seedCompanyAndAgent();
     await seedRun({ companyId, agentId, status: "running" });
 
-    await expect(
-      seedRun({ companyId, agentId, status: "running" }),
-    ).rejects.toThrow(/heartbeat_runs_agent_single_running_uidx/);
+    const error = await seedRun({ companyId, agentId, status: "running" }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(error).toBeTruthy();
+    // Drizzle wraps the postgres error, so the constraint name lives on the cause chain.
+    const chain: string[] = [];
+    for (let cursor = error; cursor && typeof cursor === "object"; cursor = (cursor as { cause?: unknown }).cause) {
+      chain.push(String((cursor as { message?: unknown }).message ?? cursor));
+    }
+    expect(chain.join(" | ")).toContain("heartbeat_runs_agent_single_running_uidx");
   });
 
   it("keeps queued runs queued when the app-level slot check would allow a duplicate start", async () => {
@@ -172,25 +173,7 @@ describeEmbeddedPostgres("heartbeat single running run per agent (TON-3196)", ()
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   }, 30_000);
 
-  it("starts the queued run once the running slot frees", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent(5);
-    const running = await seedRun({ companyId, agentId, status: "running" });
-    const queued = await seedRun({ companyId, agentId, status: "queued" });
-
-    await db
-      .update(heartbeatRuns)
-      .set({ status: "succeeded", finishedAt: new Date() })
-      .where(eq(heartbeatRuns.id, running.runId));
-
-    await heartbeat.resumeQueuedRuns();
-
-    const started = await waitForCondition(async () => {
-      const [row] = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, queued.runId));
-      return row?.status !== "queued";
-    });
-    expect(started).toBe(true);
-  }, 30_000);
+  // "queued run starts once the slot frees" is pinned under the default policy in
+  // heartbeat-agent-concurrency-default.test.ts (TON-3195); this suite only covers
+  // the database-level invariant and the claim path's unique-violation handling.
 });

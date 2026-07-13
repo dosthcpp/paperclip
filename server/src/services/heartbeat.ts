@@ -9075,11 +9075,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function isSingleRunningRunPerAgentConflict(error: unknown): boolean {
     if (!error || typeof error !== "object") return false;
-    const maybe = error as { code?: string; constraint?: string; message?: string; cause?: unknown };
+    const maybe = error as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      message?: string;
+      cause?: unknown;
+    };
     if (
       maybe.code === "23505" &&
       (
         maybe.constraint === SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT ||
+        maybe.constraint_name === SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT ||
         (typeof maybe.message === "string" && maybe.message.includes(SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT))
       )
     ) {
