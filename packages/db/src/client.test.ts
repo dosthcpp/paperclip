@@ -119,6 +119,99 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   });
 
   it(
+    "fails migration 0136 closed until live adapters and linked lifecycle state are drained",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      const companyId = "00000000-0000-4000-8000-000000003209";
+      const agentId = "00000000-0000-4000-8000-000000003210";
+      const firstWakeId = "00000000-0000-4000-8000-000000003211";
+      const secondWakeId = "00000000-0000-4000-8000-000000003212";
+      const firstRunId = "00000000-0000-4000-8000-000000003213";
+      const secondRunId = "00000000-0000-4000-8000-000000003214";
+      const issueId = "00000000-0000-4000-8000-000000003215";
+
+      try {
+        const migration0136Hash = await migrationHash("0136_single_active_run_per_agent.sql");
+        await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${migration0136Hash}`;
+        await sql`DROP INDEX "heartbeat_runs_agent_single_running_uidx"`;
+
+        await sql`
+          INSERT INTO "companies" ("id", "name", "issue_prefix")
+          VALUES (${companyId}, 'Migration drain fixture', 'TMD')
+        `;
+        await sql`
+          INSERT INTO "agents" ("id", "company_id", "name", "role", "adapter_type", "adapter_config")
+          VALUES (${agentId}, ${companyId}, 'Long-running adapter', 'engineer', 'process', '{}'::jsonb)
+        `;
+        await sql`
+          INSERT INTO "agent_wakeup_requests" ("id", "company_id", "agent_id", "source", "status")
+          VALUES
+            (${firstWakeId}, ${companyId}, ${agentId}, 'assignment', 'running'),
+            (${secondWakeId}, ${companyId}, ${agentId}, 'assignment', 'running')
+        `;
+        await sql`
+          INSERT INTO "heartbeat_runs" (
+            "id", "company_id", "agent_id", "status", "wakeup_request_id", "started_at", "process_pid"
+          ) VALUES
+            (${firstRunId}, ${companyId}, ${agentId}, 'running', ${firstWakeId}, now(), 32091),
+            (${secondRunId}, ${companyId}, ${agentId}, 'running', ${secondWakeId}, now(), 32092)
+        `;
+        await sql`
+          UPDATE "agent_wakeup_requests"
+          SET "run_id" = CASE "id"
+            WHEN ${firstWakeId}::uuid THEN ${firstRunId}::uuid
+            ELSE ${secondRunId}::uuid
+          END
+          WHERE "id" IN (${firstWakeId}, ${secondWakeId})
+        `;
+        await sql`
+          INSERT INTO "issues" (
+            "id", "company_id", "title", "status", "identifier", "execution_run_id", "execution_locked_at"
+          ) VALUES (${issueId}, ${companyId}, 'Locked by live adapter', 'in_progress', 'TMD-1', ${secondRunId}, now())
+        `;
+
+        await expect(applyPendingMigrations(connectionString)).rejects.toThrow(
+          /Cannot enforce one active run per agent while 2 heartbeat run\(s\) are still running/,
+        );
+
+        const preserved = await sql<{
+          running_count: number;
+          running_wake_count: number;
+          locked_run_id: string | null;
+        }[]>`
+          SELECT
+            (SELECT count(*)::integer FROM "heartbeat_runs" WHERE "status" = 'running') AS "running_count",
+            (SELECT count(*)::integer FROM "agent_wakeup_requests" WHERE "status" = 'running') AS "running_wake_count",
+            (SELECT "execution_run_id"::text FROM "issues" WHERE "id" = ${issueId}) AS "locked_run_id"
+        `;
+        expect(preserved[0]).toEqual({
+          running_count: 2,
+          running_wake_count: 2,
+          locked_run_id: secondRunId,
+        });
+
+        // Simulate the rollout gate draining adapters through the normal lifecycle
+        // before retrying: runs and wakes finish and the issue execution lock releases.
+        await sql`UPDATE "issues" SET "execution_run_id" = NULL, "execution_locked_at" = NULL WHERE "id" = ${issueId}`;
+        await sql`UPDATE "agent_wakeup_requests" SET "status" = 'done', "finished_at" = now() WHERE "agent_id" = ${agentId}`;
+        await sql`UPDATE "heartbeat_runs" SET "status" = 'succeeded', "finished_at" = now() WHERE "agent_id" = ${agentId}`;
+
+        await expect(applyPendingMigrations(connectionString)).resolves.toBeUndefined();
+        await expect(sql`
+          INSERT INTO "heartbeat_runs" ("company_id", "agent_id", "status")
+          VALUES (${companyId}, ${agentId}, 'running'), (${companyId}, ${agentId}, 'running')
+        `).rejects.toThrow(/heartbeat_runs_agent_single_running_uidx/);
+      } finally {
+        await sql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
     "applies an inserted earlier migration without replaying later legacy migrations",
     async () => {
       const connectionString = await createTempDatabase();

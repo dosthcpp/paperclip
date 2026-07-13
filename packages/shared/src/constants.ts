@@ -77,8 +77,9 @@ export const AGENT_ROLE_LABELS: Record<AgentRole, string> = {
 
 // One agent = one workspace/session: concurrent runs on the same agent race on
 // shared production files, so runs serialize by default and extra wakes queue
-// behind the live run. Raise per agent via runtimeConfig.heartbeat.maxConcurrentRuns
-// only when that agent's runs are proven not to share mutable state (TON-3195).
+// behind the live run. The database invariant currently keeps effective concurrency
+// at one even when runtimeConfig.heartbeat.maxConcurrentRuns is greater than one.
+// Isolated-workspace concurrency is tracked separately in TON-3201.
 export const AGENT_DEFAULT_MAX_CONCURRENT_RUNS = 1;
 export const WORKSPACE_BRANCH_ROUTINE_VARIABLE = "workspaceBranch";
 

@@ -24,6 +24,19 @@ Data persists across restarts. To reset: `rm -rf ~/.paperclip/instances/default/
 
 The Docker quickstart also uses embedded PostgreSQL by default.
 
+### Upgrading through migration 0136
+
+Migration `0136_single_active_run_per_agent` adds the database invariant that an
+agent can have only one `running` heartbeat run. It intentionally fails while any
+heartbeat run is still live; it never demotes a live row on its own.
+
+Before applying this migration, stop scheduler dispatch, drain or terminate all
+adapter processes, and wait for normal run finalization to release claimed wake
+requests, issue execution locks, and environment/runtime leases. Retry the
+migration only after there are no `running` rows. Until isolated execution
+workspaces are supported, `runtimeConfig.heartbeat.maxConcurrentRuns > 1` remains
+effectively serialized to one run by the database constraint.
+
 ## 2. Local PostgreSQL (Docker)
 
 For a full PostgreSQL server locally:
