@@ -252,6 +252,9 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+// Partial unique index on heartbeat_runs (agent_id) WHERE status = 'running' — the
+// database-level guard that at most one run per agent is running at a time (TON-3196).
+const SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT = "heartbeat_runs_agent_single_running_uidx";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -9070,6 +9073,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  function isSingleRunningRunPerAgentConflict(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const maybe = error as { code?: string; constraint?: string; message?: string; cause?: unknown };
+    if (
+      maybe.code === "23505" &&
+      (
+        maybe.constraint === SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT ||
+        (typeof maybe.message === "string" && maybe.message.includes(SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT))
+      )
+    ) {
+      return true;
+    }
+    return isSingleRunningRunPerAgentConflict(maybe.cause);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -9165,17 +9183,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    let claimed: typeof heartbeatRuns.$inferSelect | null = null;
+    try {
+      claimed = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+    } catch (error) {
+      if (!isSingleRunningRunPerAgentConflict(error)) throw error;
+      // The partial unique index heartbeat_runs_agent_single_running_uidx is the
+      // authoritative guard: another run of this agent is already running, so this
+      // run stays queued and a later sweep starts it once the slot frees (TON-3196).
+      logger.warn(
+        { runId: run.id, agentId: run.agentId },
+        "claimQueuedRun: agent already has a running run; leaving run queued",
+      );
+      return null;
+    }
     if (!claimed) return null;
 
     publishLiveEvent({

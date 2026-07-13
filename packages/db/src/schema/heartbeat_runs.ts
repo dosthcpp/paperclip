@@ -1,4 +1,5 @@
-import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -84,5 +85,11 @@ export const heartbeatRuns = pgTable(
       table.status,
       table.processStartedAt,
     ),
+    // One agent = one workspace/session: concurrent running runs of the same agent
+    // race on shared production files, so the invariant is enforced here rather
+    // than by application-level slot checks (TON-3196).
+    agentSingleRunningUidx: uniqueIndex("heartbeat_runs_agent_single_running_uidx")
+      .on(table.agentId)
+      .where(sql`${table.status} = 'running'`),
   }),
 );
