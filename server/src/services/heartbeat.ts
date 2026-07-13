@@ -39,6 +39,7 @@ import {
   documentAnnotationComments,
   documentAnnotationThreads,
   documentRevisions,
+  executionWorkspaces,
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -252,9 +253,24 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
-// Partial unique index on heartbeat_runs (agent_id) WHERE status = 'running' — the
-// database-level guard that at most one run per agent is running at a time (TON-3196).
-const SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT = "heartbeat_runs_agent_single_running_uidx";
+const RUNNING_WORKSPACE_SCOPE_CONSTRAINT = "heartbeat_runs_running_workspace_scope_uidx";
+const RUNNING_SERIAL_AGENT_CONSTRAINT = "heartbeat_runs_running_serial_agent_uidx";
+const RUNNING_ISOLATED_SESSION_CONSTRAINT = "heartbeat_runs_running_isolated_session_uidx";
+const RUN_CONCURRENCY_CONSTRAINTS = new Set([
+  RUNNING_WORKSPACE_SCOPE_CONSTRAINT,
+  RUNNING_SERIAL_AGENT_CONSTRAINT,
+  RUNNING_ISOLATED_SESSION_CONSTRAINT,
+]);
+
+export function canClaimHeartbeatConcurrencySlot(input: {
+  isolated: boolean;
+  runningCount: number;
+  serialRunningCount: number;
+  maxConcurrentRuns: number;
+}) {
+  if (input.runningCount >= input.maxConcurrentRuns) return false;
+  return input.isolated ? input.serialRunningCount === 0 : input.runningCount === 0;
+}
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -9086,7 +9102,91 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
-  function isSingleRunningRunPerAgentConflict(error: unknown): boolean {
+  type RunConcurrencyClaim = {
+    scopeKey: string;
+    sessionKey: string | null;
+    isolated: boolean;
+  };
+
+  function serialRunConcurrencyClaim(agentId: string): RunConcurrencyClaim {
+    return {
+      scopeKey: `agent-fallback:${agentId}`,
+      sessionKey: null,
+      isolated: false,
+    };
+  }
+
+  async function canonicalWorkspaceScopeKey(input: {
+    cwd?: string | null;
+    providerType?: string | null;
+    providerRef?: string | null;
+  }): Promise<string | null> {
+    const cwd = readNonEmptyString(input.cwd);
+    if (cwd) {
+      const canonical = await fs.realpath(cwd).catch(() => null);
+      if (canonical) return `local:${canonical}`;
+    }
+    const providerRef = readNonEmptyString(input.providerRef);
+    if (!providerRef) return null;
+    return `provider:${readNonEmptyString(input.providerType) ?? "unknown"}:${providerRef}`;
+  }
+
+  async function resolveRunConcurrencyClaim(
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<RunConcurrencyClaim> {
+    const fallback = serialRunConcurrencyClaim(run.agentId);
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+    const sessionKey = deriveTaskKey(context, null);
+    if (!issueId || !sessionKey) return fallback;
+
+    const issue = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (
+      !issue?.executionWorkspaceId ||
+      issue.executionWorkspacePreference !== "reuse_existing"
+    ) {
+      return fallback;
+    }
+
+    const workspace = await db
+      .select({
+        mode: executionWorkspaces.mode,
+        status: executionWorkspaces.status,
+        cwd: executionWorkspaces.cwd,
+        providerType: executionWorkspaces.providerType,
+        providerRef: executionWorkspaces.providerRef,
+        closedAt: executionWorkspaces.closedAt,
+      })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.id, issue.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, run.companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (
+      !workspace ||
+      workspace.mode !== "isolated_workspace" ||
+      workspace.status === "archived" ||
+      workspace.closedAt
+    ) {
+      return fallback;
+    }
+
+    const scopeKey = await canonicalWorkspaceScopeKey(workspace);
+    if (!scopeKey) return fallback;
+    return { scopeKey, sessionKey, isolated: true };
+  }
+
+  function isRunConcurrencyConflict(error: unknown): boolean {
     if (!error || typeof error !== "object") return false;
     const maybe = error as {
       code?: string;
@@ -9098,14 +9198,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       maybe.code === "23505" &&
       (
-        maybe.constraint === SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT ||
-        maybe.constraint_name === SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT ||
-        (typeof maybe.message === "string" && maybe.message.includes(SINGLE_RUNNING_RUN_PER_AGENT_CONSTRAINT))
+        (typeof maybe.constraint === "string" && RUN_CONCURRENCY_CONSTRAINTS.has(maybe.constraint)) ||
+        (typeof maybe.constraint_name === "string" && RUN_CONCURRENCY_CONSTRAINTS.has(maybe.constraint_name)) ||
+        (typeof maybe.message === "string" && [...RUN_CONCURRENCY_CONSTRAINTS].some((name) => maybe.message!.includes(name)))
       )
     ) {
       return true;
     }
-    return isSingleRunningRunPerAgentConflict(maybe.cause);
+    return isRunConcurrencyConflict(maybe.cause);
   }
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
@@ -9203,27 +9303,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
+    const concurrencyClaim = await resolveRunConcurrencyClaim(run);
+    const maxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
     let claimed: typeof heartbeatRuns.$inferSelect | null = null;
     try {
-      claimed = await db
-        .update(heartbeatRuns)
-        .set({
-          status: "running",
-          responsibleUserId,
-          startedAt: run.startedAt ?? claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      claimed = await db.transaction(async (tx) => {
+        // The process-local start lock is only an optimization. This row lock
+        // serializes slot allocation for the same agent across server processes.
+        await tx.execute(
+          sql`select id from agents where id = ${run.agentId} and company_id = ${run.companyId} for update`,
+        );
+        const [{ count, serialCount }] = await tx
+          .select({
+            count: sql<number>`count(*)`,
+            serialCount: sql<number>`count(*) filter (where ${heartbeatRuns.concurrencyIsolated} = false)`,
+          })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")));
+        const runningCount = Number(count ?? 0);
+        if (!canClaimHeartbeatConcurrencySlot({
+          isolated: concurrencyClaim.isolated,
+          runningCount,
+          serialRunningCount: Number(serialCount ?? 0),
+          maxConcurrentRuns,
+        })) {
+          return null;
+        }
+
+        return tx
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            concurrencyScopeKey: concurrencyClaim.scopeKey,
+            concurrencySessionKey: concurrencyClaim.sessionKey,
+            concurrencyIsolated: concurrencyClaim.isolated,
+            responsibleUserId,
+            startedAt: run.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
     } catch (error) {
-      if (!isSingleRunningRunPerAgentConflict(error)) throw error;
-      // The partial unique index heartbeat_runs_agent_single_running_uidx is the
-      // authoritative guard: another run of this agent is already running, so this
-      // run stays queued and a later sweep starts it once the slot frees (TON-3196).
+      if (!isRunConcurrencyConflict(error)) throw error;
       logger.warn(
-        { runId: run.id, agentId: run.agentId },
-        "claimQueuedRun: agent already has a running run; leaving run queued",
+        {
+          runId: run.id,
+          agentId: run.agentId,
+          concurrencyScopeKey: concurrencyClaim.scopeKey,
+          concurrencySessionKey: concurrencyClaim.sessionKey,
+          concurrencyIsolated: concurrencyClaim.isolated,
+        },
+        "claimQueuedRun: mutable workspace/session scope already running; leaving run queued",
       );
       return null;
     }
@@ -11113,6 +11245,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (Object.keys(nextIssuePatch).length > 0) {
         await issuesSvc.update(issueId, nextIssuePatch);
+      }
+    }
+    if (run.concurrencyIsolated) {
+      const actualScopeKey = persistedExecutionWorkspace
+        ? await canonicalWorkspaceScopeKey({
+            cwd: persistedExecutionWorkspace.cwd,
+            providerType: persistedExecutionWorkspace.providerType,
+            providerRef: persistedExecutionWorkspace.providerRef,
+          })
+        : null;
+      const actualSessionKey = deriveTaskKey(context, null);
+      if (
+        !persistedExecutionWorkspace ||
+        persistedExecutionWorkspace.mode !== "isolated_workspace" ||
+        !actualScopeKey ||
+        actualScopeKey !== run.concurrencyScopeKey ||
+        !actualSessionKey ||
+        actualSessionKey !== run.concurrencySessionKey
+      ) {
+        throw new WorkspaceValidationFailure(
+          "The isolated execution workspace/session changed after the run claimed its concurrency scope; refusing adapter execution.",
+          {
+            workspaceValidation: {
+              reason: "concurrency_scope_changed_after_claim",
+              issueId,
+              claimedScopeKey: run.concurrencyScopeKey,
+              actualScopeKey,
+              claimedSessionKey: run.concurrencySessionKey,
+              actualSessionKey,
+              persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+              persistedExecutionWorkspaceMode: persistedExecutionWorkspace?.mode ?? null,
+            },
+          },
+        );
       }
     }
     if (persistedExecutionWorkspace) {

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean, check, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -13,6 +13,9 @@ export const heartbeatRuns = pgTable(
     invocationSource: text("invocation_source").notNull().default("on_demand"),
     triggerDetail: text("trigger_detail"),
     status: text("status").notNull().default("queued"),
+    concurrencyScopeKey: text("concurrency_scope_key"),
+    concurrencySessionKey: text("concurrency_session_key"),
+    concurrencyIsolated: boolean("concurrency_isolated").notNull().default(false),
     responsibleUserId: text("responsible_user_id"),
     startedAt: timestamp("started_at", { withTimezone: true }),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
@@ -85,11 +88,22 @@ export const heartbeatRuns = pgTable(
       table.status,
       table.processStartedAt,
     ),
-    // One agent = one workspace/session: concurrent running runs of the same agent
-    // race on shared production files, so the invariant is enforced here rather
-    // than by application-level slot checks (TON-3196).
-    agentSingleRunningUidx: uniqueIndex("heartbeat_runs_agent_single_running_uidx")
-      .on(table.agentId)
+    runningScopeRequiredCheck: check(
+      "heartbeat_runs_running_scope_required_check",
+      sql`${table.status} <> 'running' OR (${table.concurrencyScopeKey} IS NOT NULL AND (${table.concurrencyIsolated} = false OR ${table.concurrencySessionKey} IS NOT NULL))`,
+    ),
+    // A mutable workspace/session scope may have only one active writer, even when
+    // separate server processes race to claim runs for different agents.
+    runningWorkspaceScopeUidx: uniqueIndex("heartbeat_runs_running_workspace_scope_uidx")
+      .on(table.concurrencyScopeKey)
       .where(sql`${table.status} = 'running'`),
+    // Shared, agent-default, and unknown scopes remain fail-safe serialized per
+    // agent. Only independently isolated scopes may consume parallel agent slots.
+    runningSerialAgentUidx: uniqueIndex("heartbeat_runs_running_serial_agent_uidx")
+      .on(table.agentId)
+      .where(sql`${table.status} = 'running' AND ${table.concurrencyIsolated} = false`),
+    runningIsolatedSessionUidx: uniqueIndex("heartbeat_runs_running_isolated_session_uidx")
+      .on(table.agentId, table.concurrencySessionKey)
+      .where(sql`${table.status} = 'running' AND ${table.concurrencyIsolated} = true`),
   }),
 );

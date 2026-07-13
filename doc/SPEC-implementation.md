@@ -887,7 +887,10 @@ Per-agent schedule fields in `adapter_config`:
 Scheduler must skip invocation when:
 
 - agent is paused/terminated
-- an existing run is active
+- the configured per-agent slot limit is full
+- a running run already owns the same mutable workspace/session scope
+- the candidate lacks a verified isolated workspace while another non-isolated
+  run for that agent is active
 - hard budget limit has been hit
 
 ## 12. Governance and Approval Flows
