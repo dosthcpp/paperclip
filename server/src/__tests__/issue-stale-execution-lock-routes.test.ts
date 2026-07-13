@@ -288,6 +288,63 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue run ownership conflict");
+    expect(res.body?.details?.executionRun).toMatchObject({
+      runId: liveOwnerRunId,
+      status: "running",
+      disposition: "live_run",
+    });
+  });
+
+  it("labels a queued scheduled-retry lock holder as pending, not stale (TON-3168)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const pendingRetryRunId = randomUUID();
+    const crashedRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: crashedRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "assignment",
+        errorCode: "process_lost",
+        finishedAt: new Date(),
+      },
+      {
+        // Incident shape: retry row created but not yet started — holds the
+        // execution lock legitimately while it waits for a scheduler slot.
+        id: pendingRetryRunId,
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        invocationSource: "assignment",
+        retryOfRunId: crashedRunId,
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Lock held by pending scheduled retry",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: pendingRetryRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Should conflict with pending retry" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.error).toBe("Issue run ownership conflict");
+    expect(res.body?.details?.executionRun).toMatchObject({
+      runId: pendingRetryRunId,
+      status: "scheduled_retry",
+      retryOfRunId: crashedRunId,
+      disposition: "pending_scheduled_run",
+    });
   });
 
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {

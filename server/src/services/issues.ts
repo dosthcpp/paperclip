@@ -4509,6 +4509,34 @@ export function issueService(db: Db) {
     });
   }
 
+  // TON-3168: 409 lock-conflict payloads used to carry only run ids, so an
+  // operator could not tell a pending scheduled retry (lock is legitimate and
+  // resolves itself once the retry runs) from a genuinely stale lock (terminal
+  // run — cleared on contact or by the recovery sweep). Attach the holder
+  // run's live state so the conflict is diagnosable from the error body alone.
+  async function describeLockHolderRun(runId: string | null) {
+    if (!runId) return null;
+    const run = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        createdAt: heartbeatRuns.createdAt,
+        startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return { runId, status: null, disposition: "stale_missing_run" };
+    const disposition = TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
+      ? "stale_terminal_run"
+      : run.startedAt
+        ? "live_run"
+        : "pending_scheduled_run";
+    return { runId, ...run, disposition };
+  }
+
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
@@ -6604,6 +6632,7 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        executionRun: await describeLockHolderRun(current.executionRunId),
       });
     },
 
@@ -6735,6 +6764,7 @@ export function issueService(db: Db) {
           assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
           checkoutRunId: resolvedLatest.latest.checkoutRunId,
           executionRunId: resolvedLatest.latest.executionRunId,
+          executionRun: await describeLockHolderRun(resolvedLatest.latest.executionRunId),
           actorAgentId,
           actorRunId,
         });
@@ -6746,6 +6776,7 @@ export function issueService(db: Db) {
         assigneeAgentId: latest.assigneeAgentId,
         checkoutRunId: latest.checkoutRunId,
         executionRunId: latest.executionRunId,
+        executionRun: await describeLockHolderRun(latest.executionRunId),
         actorAgentId,
         actorRunId,
       });
