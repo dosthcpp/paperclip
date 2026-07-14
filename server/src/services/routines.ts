@@ -1132,6 +1132,7 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    resultText?: string;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -1147,7 +1148,7 @@ export function routineService(
         .update(routineTriggers)
         .set({
           lastFiredAt: input.triggeredAt,
-          lastResult: nextResultText(input.status, input.issueId),
+          lastResult: input.resultText ?? nextResultText(input.status, input.issueId),
           nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
@@ -1156,8 +1157,8 @@ export function routineService(
   }
 
   // Records a skipped scheduled firing without creating an execution issue. Used when the
-  // routine's project is paused: the tick is still claimed/advanced upstream (no backfill),
-  // and run history + trigger audit reflect the pause-specific skip.
+  // routine's project or workspace (company) is paused: the tick is still claimed/advanced
+  // upstream (no backfill), and run history + trigger audit reflect the pause-specific skip.
   async function recordSuppressedScheduleRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect;
@@ -2736,10 +2737,12 @@ export function routineService(
         .select({
           trigger: routineTriggers,
           routine: routines,
+          companyStatus: companies.status,
           projectPausedAt: projects.pausedAt,
         })
         .from(routineTriggers)
         .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
+        .innerJoin(companies, eq(routines.companyId, companies.id))
         .leftJoin(projects, eq(routines.projectId, projects.id))
         .where(
           and(
@@ -2753,19 +2756,24 @@ export function routineService(
         .orderBy(asc(routineTriggers.nextRunAt), asc(routineTriggers.createdAt));
 
       let triggered = 0;
+      let skippedPaused = 0;
       for (const row of due) {
         if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
 
-        // Suppress scheduled firings while the routine's project is paused. The tick is still
-        // claimed and advanced to the next single cron tick (no backfill), so resume continues
-        // at the next cron boundary instead of replaying missed firings. Routines with no
-        // project are never suppressed here.
+        // Suppress scheduled firings while the workspace (company) or the routine's
+        // project is paused. The workspace pause flag acts as an operator kill switch.
+        // Either way the tick is still claimed and advanced to the next single cron
+        // tick (no backfill), so resume continues at the next cron boundary instead
+        // of replaying missed firings. Routines with no project are only subject to
+        // the workspace-level pause.
+        const companyPaused = row.companyStatus === "paused";
         const projectPaused = !!(row.routine.projectId && row.projectPausedAt);
+        const paused = companyPaused || projectPaused;
 
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
 
-        if (!projectPaused && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
+        if (!paused && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           let cursor: Date | null = row.trigger.nextRunAt;
           runCount = 0;
           while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
@@ -2792,13 +2800,14 @@ export function routineService(
           .then((rows) => rows[0] ?? null);
         if (!claimed) continue;
 
-        if (projectPaused) {
+        if (paused) {
           await recordSuppressedScheduleRun({
             routine: row.routine,
             trigger: row.trigger,
             reason: "paused",
             nextRunAt: claimedNextRunAt,
           });
+          skippedPaused += 1;
           continue;
         }
 
@@ -2812,7 +2821,7 @@ export function routineService(
         }
       }
 
-      return { triggered };
+      return { triggered, skippedPaused };
     },
 
     syncRunStatusForIssue: async (issueId: string) => {
