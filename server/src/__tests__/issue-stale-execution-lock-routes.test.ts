@@ -258,17 +258,12 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   });
 
   it("still returns 409 when a different live checkout owner is active", async () => {
-    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
-    const liveOwnerRunId = randomUUID();
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    // heartbeat_runs_agent_single_running_uidx (TON-3196) allows only one
+    // running run per agent, so the seeded running run IS the live owner;
+    // the caller acts under the terminal failedRunId.
+    const liveOwnerRunId = currentRunId;
     const issueId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: liveOwnerRunId,
-      companyId,
-      agentId,
-      status: "running",
-      invocationSource: "manual",
-      startedAt: new Date(),
-    });
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -351,13 +346,15 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const contenderRunId = randomUUID();
     const issueId = randomUUID();
+    // Post-TON-3196 the agent can hold only one running run, so a same-agent
+    // checkout contender is a queued run racing to claim the slot. The 409
+    // path only inspects the lock holder's run, not the contender's status.
     await db.insert(heartbeatRuns).values({
       id: contenderRunId,
       companyId,
       agentId,
-      status: "running",
+      status: "queued",
       invocationSource: "assignment",
-      startedAt: new Date(),
     });
     await db.insert(issues).values({
       id: issueId,
