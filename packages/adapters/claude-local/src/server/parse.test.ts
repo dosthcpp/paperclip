@@ -7,6 +7,7 @@ import {
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
+  isClaudeRunFailed,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -132,6 +133,148 @@ describe("isClaudeTransientUpstreamError", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+// TON-3281. Fixtures are the terminal `result` events of three real production runs. All
+// three report `subtype: "success"`, so subtype alone cannot separate them -- these pin the
+// fields that can.
+//
+//   A  run ee3e588a  exit 143, is_error=false, terminal_reason=completed   -> CTO finished TON-3274
+//   B  run d4940cf4  exit 1,   is_error=true,  terminal_reason=api_error   -> credits exhausted
+//   C  run b824d2f1  exit 143, is_error=true,  terminal_reason=api_error   -> credits exhausted
+//                                                                             after $11.79 of work
+//
+// A was recorded as a failure, froze the agent at `status=error`, and overwrote `errorReason`
+// with the agent's own report. C is the trap: suppressing exit 143 wholesale would turn a real
+// billing failure green.
+const RUN_A_SUCCESS = {
+  subtype: "success",
+  is_error: false,
+  terminal_reason: "completed",
+  result: "**TON-3274 is done.** The reported bug was already fixed — but the card still bought us something real.",
+} as const;
+
+const RUN_BC_CREDITS_EXHAUSTED = {
+  subtype: "success",
+  is_error: true,
+  terminal_reason: "api_error",
+  result: "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch.",
+} as const;
+
+describe("isClaudeRunFailed", () => {
+  it("does not fail a successful run that the runtime itself reaped after its terminal result", () => {
+    // The bug: exit 143 is our own SIGTERM from terminalResultCleanup, not the run's verdict.
+    expect(
+      isClaudeRunFailed({
+        parsed: { ...RUN_A_SUCCESS },
+        exitCode: 143,
+        terminalResultCleanupKilled: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps credit exhaustion red even when the runtime reaped the process (exit 143)", () => {
+    // The trap: is_error must stay an unconditional OR, never AND-gated by the exit code.
+    expect(
+      isClaudeRunFailed({
+        parsed: { ...RUN_BC_CREDITS_EXHAUSTED },
+        exitCode: 143,
+        terminalResultCleanupKilled: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps credit exhaustion red on a plain non-zero exit", () => {
+    expect(
+      isClaudeRunFailed({
+        parsed: { ...RUN_BC_CREDITS_EXHAUSTED },
+        exitCode: 1,
+        terminalResultCleanupKilled: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("still fails a run that died on its own, cleanup or not", () => {
+    expect(isClaudeRunFailed({ parsed: null, exitCode: 1 })).toBe(true);
+    expect(
+      isClaudeRunFailed({ parsed: { ...RUN_A_SUCCESS }, exitCode: 1, terminalResultCleanupKilled: false }),
+    ).toBe(true);
+  });
+
+  it("passes a clean exit", () => {
+    expect(isClaudeRunFailed({ parsed: { ...RUN_A_SUCCESS }, exitCode: 0 })).toBe(false);
+  });
+});
+
+describe("claude_local classifiers do not read agent-authored bytes", () => {
+  // Every Claude run emits rate_limit_info telemetry. On a healthy account it still carries a
+  // `rateLimitType` key, which the transient regex matched -- so any failed run looked like a
+  // rate-limit and earned a retry.
+  const HEALTHY_RATE_LIMIT_TELEMETRY =
+    '{"type":"system","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.8,"isUsingOverage":false}}';
+
+  // An agent reading its own deploy script -- i.e. ordinary tool output.
+  const AGENT_TOOL_OUTPUT =
+    '{"type":"user","content":"429) echo \\"FAIL  rate limited — too many submissions\\" >&2; exit 1 ;;"}';
+
+  it("does not call a completed run transient because its stdout mentions rate limits", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { ...RUN_A_SUCCESS },
+        stdout: [HEALTHY_RATE_LIMIT_TELEMETRY, AGENT_TOOL_OUTPUT].join("\n"),
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not call a completed run auth-required because its stdout mentions 401/unauthorized", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { ...RUN_A_SUCCESS },
+        stdout: '{"type":"user","content":"the API key returns 401 unauthorized; authentication required"}',
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("still reads stdout when the CLI died before emitting a terminal result", () => {
+    // No terminal result: the CLI's own error text may exist nowhere else.
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "Not logged in. Please run `claude login`.",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 529 overloaded_error",
+        stderr: "",
+      }),
+    ).toBe(true);
+  });
+
+  it("still classifies a genuine upstream failure from the CLI's own result text", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: { ...RUN_BC_CREDITS_EXHAUSTED } })).toBe(true);
+  });
+
+  it("classifies the session-limit wording and recovers its reset time for backoff", () => {
+    // Verbatim from run efed1f88. Previously matched nothing here, so the run was retried
+    // with no backoff at all.
+    const parsed = {
+      subtype: "success",
+      is_error: true,
+      terminal_reason: "api_error",
+      result: "You've hit your session limit · resets 7pm (Asia/Seoul)",
+    };
+    expect(isClaudeTransientUpstreamError({ parsed })).toBe(true);
+
+    const now = new Date("2026-07-14T06:00:00Z"); // 15:00 Asia/Seoul
+    const retryAt = extractClaudeRetryNotBefore({ parsed }, now);
+    expect(retryAt).not.toBeNull();
+    expect(retryAt!.toISOString()).toBe("2026-07-14T10:00:00.000Z"); // 19:00 Asia/Seoul
   });
 });
 

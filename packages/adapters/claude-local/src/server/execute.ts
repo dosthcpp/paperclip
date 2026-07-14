@@ -47,6 +47,7 @@ import {
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
+  isClaudeRunFailed,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
@@ -906,8 +907,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // is intentionally independent of `failed` — otherwise a refusal looks like a
     // successful run to Paperclip and the heartbeat stalls silently. See RY-604.
     const claudeRefusal = isClaudeRefusalResult(parsed);
-    const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    const failed = isClaudeRunFailed({
+      parsed,
+      exitCode: proc.exitCode,
+      terminalResultCleanupKilled: proc.terminalResultCleanupKilled,
+    });
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1011,10 +1015,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+    // Gate on the real verdict, not the bare exit code: a successful run that we reaped
+    // ourselves exits 143, and these probes read `parsed.result` -- the agent's own report.
+    // An agent that merely writes about session handling would otherwise convict its own
+    // healthy run of a session error and earn a session-clearing retry (TON-3281).
     const sessionErrorKind =
       sessionId &&
       !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
+      isClaudeRunFailed({
+        parsed: initial.parsed,
+        exitCode: initial.proc.exitCode,
+        terminalResultCleanupKilled: initial.proc.terminalResultCleanupKilled,
+      }) &&
       initial.parsed
         ? isClaudeUnknownSessionError(initial.parsed)
           ? "unknown"

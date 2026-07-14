@@ -102,6 +102,7 @@ import {
   issueThreadInteractionService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  type IssueFilters,
   issueReferenceService,
   issueService,
   clampIssueListLimit,
@@ -4065,6 +4066,9 @@ export function issueRoutes(
       ? Number.parseInt(rawLimit, 10)
       : null;
     const limit = parsedLimit === null ? ISSUE_LIST_DEFAULT_LIMIT : clampIssueListLimit(parsedLimit);
+    // TON-3263: a limit above the server max is clamped, never silently — the
+    // response signals it via X-List-Limit-Clamped and the includeMeta envelope.
+    const limitClamped = parsedLimit !== null && parsedLimit > ISSUE_LIST_MAX_LIMIT;
     const rawOffset = req.query.offset as string | undefined;
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
@@ -4074,6 +4078,7 @@ export function issueRoutes(
     const sortDir = req.query.sortDir as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
+    const includeMeta = parseOptionalBooleanQuery(req.query.includeMeta);
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
 
@@ -4121,6 +4126,10 @@ export function issueRoutes(
       res.status(400).json({ error: "includeLiveDescendantSummary must be true or false when provided" });
       return;
     }
+    if (includeMeta === null) {
+      res.status(400).json({ error: "includeMeta must be true or false when provided" });
+      return;
+    }
     if (assigneeAgentFilterRaw !== undefined) {
       if (typeof assigneeAgentFilterRaw !== "string") {
         res.status(422).json({ error: "assigneeAgentId must be a UUID or 'null'" });
@@ -4140,8 +4149,8 @@ export function issueRoutes(
     }
     const offset = parsedOffset ?? 0;
 
-    const rawResult = await svc.list(companyId, {
-      attention: attention === "blocked" ? "blocked" : undefined,
+    const listFilters: IssueFilters = {
+      attention: attention === "blocked" ? ("blocked" as const) : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
       participantAgentId: req.query.participantAgentId as string | undefined,
@@ -4170,18 +4179,25 @@ export function issueRoutes(
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
       hasPlanDocument,
       q: req.query.q as string | undefined,
-      limit,
-      offset,
-      sortField: sortField === "updated" ? "updated" : undefined,
+      sortField: sortField === "updated" ? ("updated" as const) : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
-    });
-    const result = await actorCanReadCompanyScope(req, companyId)
+    };
+    // TON-3263: over-fetch one row past the page so truncation is observable
+    // (hasMore) instead of silent.
+    const rawPage = await svc.list(companyId, { ...listFilters, limit: limit + 1, offset });
+    const hasMore = rawPage.length > limit;
+    const rawResult = hasMore ? rawPage.slice(0, limit) : rawPage;
+    const canReadCompanyScope = await actorCanReadCompanyScope(req, companyId);
+    const result = canReadCompanyScope
       ? rawResult
       : await filterIssuesForActor(req, rawResult);
     const issueIds = result.map((issue) => issue.id);
-    const [handoffStates, recoveryActionByIssue] = await Promise.all([
+    const [handoffStates, recoveryActionByIssue, total] = await Promise.all([
       listSuccessfulRunHandoffStates(db, companyId, issueIds),
       recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
+      // Exact filtered total. Restricted actors would need a full visibility
+      // scan (see issues/count); they get total=null rather than a leaky count.
+      canReadCompanyScope ? svc.countList(companyId, listFilters) : Promise.resolve(null),
     ]);
     const actor = getActorInfo(req);
     await Promise.all(result.map(async (issue) => {
@@ -4196,11 +4212,36 @@ export function issueRoutes(
       if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
       else recoveryActionByIssue.delete(issue.id);
     }));
-    res.json(result.map((issue) => ({
+    const items = result.map((issue) => ({
       ...issue,
       successfulRunHandoff: handoffStates.get(issue.id) ?? null,
       activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-    })));
+    }));
+    const nextOffset = hasMore ? offset + limit : null;
+    // TON-3263: truncation metadata rides on every response, whatever the body
+    // shape, so no caller ever has to guess whether the page was cut.
+    res.setHeader("X-List-Limit", String(limit));
+    res.setHeader("X-List-Offset", String(offset));
+    res.setHeader("X-List-Max-Limit", String(ISSUE_LIST_MAX_LIMIT));
+    res.setHeader("X-Has-More", hasMore ? "true" : "false");
+    if (total !== null) res.setHeader("X-Total-Count", String(total));
+    if (nextOffset !== null) res.setHeader("X-Next-Offset", String(nextOffset));
+    if (limitClamped) res.setHeader("X-List-Limit-Clamped", "true");
+    if (includeMeta === true) {
+      res.json({
+        items,
+        total,
+        hasMore,
+        nextOffset,
+        limit,
+        offset,
+        maxLimit: ISSUE_LIST_MAX_LIMIT,
+        requestedLimit: parsedLimit ?? limit,
+        limitClamped,
+      });
+      return;
+    }
+    res.json(items);
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {

@@ -276,12 +276,19 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
         permissions: {},
       },
     ]);
+    // heartbeat_runs_running_workspace_scope_uidx (TON-3196/TON-3201) allows a
+    // second running run for the same agent only under a distinct isolated
+    // workspace scope, so the two concurrent running runs claim separate
+    // isolated scopes the way production workspace-bound runs do.
     await db.insert(heartbeatRuns).values([
       {
         id: rootRunId,
         companyId,
         agentId,
         status: "running",
+        concurrencyScopeKey: `local:/tmp/ws-${rootRunId}`,
+        concurrencySessionKey: `issue:${rootIssueId}`,
+        concurrencyIsolated: true,
         contextSnapshot: { issueId: rootIssueId },
       },
       {
@@ -296,6 +303,9 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
         companyId,
         agentId,
         status: "running",
+        concurrencyScopeKey: `local:/tmp/ws-${hiddenRunId}`,
+        concurrencySessionKey: `issue:${hiddenChildIssueId}`,
+        concurrencyIsolated: true,
         contextSnapshot: { issueId: hiddenChildIssueId },
       },
       {
