@@ -184,6 +184,7 @@ import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { markAgentRunningForDispatch } from "./agent-dispatch-state.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -11702,12 +11703,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       // Pause Durability: flip to "running" ONLY if the agent is still invokable.
       // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
-      const runningAgent = await db
-        .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
-        .where(and(eq(agents.id, agent.id), notInArray(agents.status, [...DIRECT_NON_INVOKABLE_STATUSES])))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      // Also clears any stale errorReason from the failure we are recovering from.
+      const runningAgent = await markAgentRunningForDispatch(db, agent.id);
 
       if (!runningAgent) {
         logger.warn(
