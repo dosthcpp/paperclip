@@ -68,12 +68,40 @@ rm -rf "$OUT_DIR"
 # reproduces the flat real-directory layout `--legacy` used to give. (TON-2280)
 pnpm --filter "$FILTER" deploy --prod --node-linker=hoisted "$OUT_DIR"
 
+# ── Step 2.5: sever hardlinks — the artifact must own every inode ───────────────
+# `pnpm deploy` HARDLINKS workspace files into the artifact, and tsc rewrites
+# packages/**/dist/*.js IN PLACE (truncate+rewrite, same inode). Any later
+# rebuild of the source tree therefore silently rewrites every artifact sharing
+# those inodes — releases stop being immutable and rollback targets lie
+# (TON-3121: a 6/26 release ended up importing a module that only existed in
+# July). Rewrite EVERY multi-link file onto a fresh inode, regardless of file
+# type — defending one file type at a time is how package.json got the
+# tmp+rename treatment while dist/** stayed exposed.
+echo "  [2.5/4] Severing hardlinks (release immutability, TON-3121)..."
+SEVERED=0
+while IFS= read -r -d '' f; do
+  # APFS clonefile when available (instant, CoW-isolated); plain copy otherwise.
+  cp -c "$f" "$f.ton3121.tmp" 2>/dev/null || cp -p "$f" "$f.ton3121.tmp"
+  mv -f "$f.ton3121.tmp" "$f"
+  SEVERED=$((SEVERED+1))
+done < <(find "$OUT_DIR" -type f -links +1 -print0)
+echo "        severed $SEVERED hardlinked file(s)"
+
 # ── Step 3: finalize (publishConfig overlay + ui-dist) ──────────────────────────
 echo "  [3/4] Finalizing..."
 bash "$REPO_ROOT/scripts/finalize-standalone-deploy.sh" "$OUT_DIR"
 
-# ── Step 4: done — verification ran inside finalize ─────────────────────────────
-echo "  [4/4] Done."
+# ── Step 4: immutability hard gate ──────────────────────────────────────────────
+# Nothing in the finished artifact may share an inode with anything (source tree
+# OR the patch/finalize steps above re-linking something). st_nlink==1 for every
+# file, or the build fails.
+LEAKED="$(find "$OUT_DIR" -type f -links +1 | head -20)"
+if [ -n "$LEAKED" ]; then
+  echo "ERROR: artifact is NOT immutable — files still share inodes (TON-3121):" >&2
+  echo "$LEAKED" >&2
+  exit 1
+fi
+echo "  [4/4] Done (immutability gate: every file owns its inode)."
 echo ""
 echo "Bootable standalone artifact: $OUT_DIR"
 echo "NEXT: boot it on an isolated PAPERCLIP_PORT + temp DB before any live swap."
