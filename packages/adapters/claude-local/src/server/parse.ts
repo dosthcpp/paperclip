@@ -315,6 +315,36 @@ function isProviderAuthoredTerminal(parsed: Record<string, unknown>): boolean {
 const CLAUDE_RESET_CLOCK_RE =
   /(?:\bresets?\b[^\n]{0,24}?(?:\d|midnight|noon|tomorrow)|limit\s+will\s+reset|retry[-\s_]?after)/i;
 
+/**
+ * The `errors[]` entries a hard verdict may read, kept deliberately narrower than
+ * `extractClaudeErrorMessages`: string entries and the `message` / `error` fields only.
+ *
+ * That general reader also takes `code` and falls back to `JSON.stringify(entry)` on an
+ * unrecognised object, which would widen the hard-verdict surface to every key an entry
+ * happens to carry -- and a hard verdict is unappealable, since the server trusts our
+ * `errorCode` before applying its own reset-clock check. This mirrors `collectTrustedText`
+ * in server/src/services/run-failure-class.ts exactly; the two must not drift.
+ */
+function readProviderErrorMessages(parsed: Record<string, unknown>): string[] {
+  const raw = Array.isArray(parsed.errors) ? parsed.errors : [];
+  const messages: string[] = [];
+
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      const msg = entry.trim();
+      if (msg) messages.push(msg);
+      continue;
+    }
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+
+    const obj = entry as Record<string, unknown>;
+    const msg = (asString(obj.message, "") || asString(obj.error, "")).trim();
+    if (msg) messages.push(msg);
+  }
+
+  return messages;
+}
+
 /** Hard billing walls. No amount of waiting clears these; a human must add credits. */
 const CLAUDE_BILLING_EXHAUSTED_RE =
   /(?:out\s+of\s+usage\s+credits|\/usage-credits\b|credit\s+balance\s+is\s+too\s+low|insufficient[\s_-]?quota|exceeded\s+your\s+current\s+quota|purchase\s+(?:more\s+)?credits|\b402\b|payment\s+required)/i;
@@ -347,7 +377,7 @@ export function isClaudeBillingExhausted(input: {
   if (!parsed) return false;
   if (!isProviderAuthoredTerminal(parsed)) return false;
 
-  const providerText = [asString(parsed.result, ""), ...extractClaudeErrorMessages(parsed)]
+  const providerText = [asString(parsed.result, ""), ...readProviderErrorMessages(parsed)]
     .map((part) => part.trim())
     .filter(Boolean)
     .join("\n");

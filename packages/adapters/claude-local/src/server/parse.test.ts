@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLAUDE_BILLING_EXHAUSTED_ERROR_CODE,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeBillingExhausted,
@@ -363,6 +364,32 @@ describe("isClaudeBillingExhausted (TON-3323)", () => {
   it("draws no verdict when the CLI died before emitting a terminal result", () => {
     // No structured shape, no provenance, no hard verdict -- however the stdout reads.
     expect(isClaudeBillingExhausted({ parsed: null })).toBe(false);
+  });
+
+  it("does not read errors[] fields the server would not trust", () => {
+    // Narrower than extractClaudeErrorMessages on purpose: no `code`, no JSON.stringify
+    // fallback. A hard verdict is unappealable -- the server trusts our errorCode before
+    // applying its own reset-clock check -- so the readable surface must match
+    // collectTrustedText in run-failure-class.ts and no more.
+    expect(
+      isClaudeBillingExhausted({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          terminal_reason: "api_error",
+          errors: [{ detail: "tool wrote: out of usage credits" }],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("pins the wire contract string the server's guard keys on", () => {
+    // This literal crosses a process boundary: the adapter ships as a separately-built
+    // plugin and cannot import the server's PROVIDER_BILLING_EXHAUSTED_ERROR_CODE. Renaming
+    // either side silently un-fires the hard-failure guard and restores the TON-3278 hot
+    // loop, so both sides pin the value. Counterpart: BILLING_ERROR_CODES in
+    // server/src/services/run-failure-class.ts.
+    expect(CLAUDE_BILLING_EXHAUSTED_ERROR_CODE).toBe("provider_billing_exhausted");
   });
 });
 
