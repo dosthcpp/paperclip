@@ -54,11 +54,10 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use the lowest-cost known Codex local model lane without changing the primary model.",
+    description:
+      "Lower-cost Codex local lane: keep the agent's primary model but drop reasoning effort. Spark is not pinned because it is rejected outright on ChatGPT-account auth (400 invalid_request_error), which turns every cheap-lane recovery run into a hard failure.",
     adapterConfig: {
-      model: "gpt-5.3-codex-spark",
-      // Spark is the cheap lane by model price; high effort keeps Codex coding behavior usable for delegated work.
-      modelReasoningEffort: "high",
+      modelReasoningEffort: "low",
     },
     source: "adapter_default",
   },

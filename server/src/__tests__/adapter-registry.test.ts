@@ -268,7 +268,9 @@ describe("server adapter registry", () => {
     await expect(listAdapterModelProfiles("codex_local")).resolves.toEqual([
       expect.objectContaining({
         key: "cheap",
-        adapterConfig: expect.objectContaining({ model: "gpt-5.3-codex-spark" }),
+        // No model pin: spark is rejected on ChatGPT-account auth, so the cheap
+        // lane keeps the agent's primary model and only lowers reasoning effort.
+        adapterConfig: expect.objectContaining({ modelReasoningEffort: "low" }),
         source: "adapter_default",
       }),
     ]);

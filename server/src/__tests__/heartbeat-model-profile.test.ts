@@ -35,8 +35,9 @@ describe("heartbeat model profile application", () => {
       configSource: "adapter_default",
       fallbackReason: null,
       adapterConfig: {
-        model: "gpt-5.3-codex-spark",
-        modelReasoningEffort: "high",
+        // No model pin: spark is rejected on ChatGPT-account auth, so the cheap
+        // lane keeps the agent's primary model and only lowers reasoning effort.
+        modelReasoningEffort: "low",
       },
     });
   });
