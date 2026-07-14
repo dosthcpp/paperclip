@@ -1,5 +1,5 @@
 /**
- * Provider failure-cause classification (TON-3278).
+ * Provider failure-cause classification (TON-3278) behind a trust boundary (TON-3314).
  *
  * The scheduler re-dispatches a stranded assigned issue on every tick
  * (`heartbeatSchedulerIntervalMs`, ~30-60s). That is correct for failures that
@@ -11,10 +11,41 @@
  *
  * This module is the single place that answers "will waiting fix this?".
  *
- * Bias: when a message could be read either way, classify it as RECOVERABLE.
- * A false "hard" verdict pauses a healthy agent (a real outage that needs a
- * human to undo); a false "recoverable" verdict costs one more cheap retry.
- * The asymmetry is deliberate — recoverable patterns are matched first and win.
+ * ## The trust boundary
+ *
+ * A hard verdict pauses the agent — a real outage that a human must undo. So a
+ * hard verdict may only be drawn from bytes the *runtime* wrote. The agent's own
+ * words reach these fields verbatim: the claude_local adapter composes
+ * `error` as `"Claude run failed: subtype=<x>: " + parsed.result`, and
+ * `parsed.result` is the agent's final report (TON-3281 froze a healthy COO by
+ * spilling its success report into `errorReason`). An agent that merely *writes
+ * about* running out of credits — a postmortem, this very comment — must not be
+ * able to pause itself two runs later.
+ *
+ * So the inputs are split by provenance:
+ *
+ *  - TRUSTED — `errorCode` (an enum only adapter code writes), and the provider's
+ *    own terminal text, unlocked only by the runtime-authored structured shape
+ *    `is_error === true && terminal_reason === "api_error"`. That shape means the
+ *    API call itself failed, so the run had no agent turn to author `result` with.
+ *    Only these bytes can produce a hard verdict.
+ *
+ *  - UNTRUSTED — everything else: `error`, an ungated `result`, `stdout`, `stderr`.
+ *    These may only ever yield a *recoverable* verdict, which merely preserves the
+ *    retry path we already had. Billing wording here is ignored by design.
+ *
+ * Untrusted bytes are read only when the trusted bytes are silent, so agent prose
+ * can neither convict (a false pause) nor exculpate (talking its way out of a real
+ * wall by mentioning "rate limit").
+ *
+ * ## Will waiting fix this?
+ *
+ * The discriminator is a reset clock, not the wording. "You've hit your session
+ * limit · resets 7pm" heals by waiting; "You're out of usage credits. Run
+ * /usage-credits ..." does not. A reset clock anywhere in the trusted text means
+ * recoverable, whatever else the message says — the same bias as before: a wrong
+ * "hard" verdict pauses a healthy agent, a wrong "recoverable" verdict costs one
+ * cheap retry.
  */
 
 export type RunFailureClass =
@@ -44,25 +75,45 @@ export const PROVIDER_BILLING_PAUSE_THRESHOLD = 2;
 /** How far back the consecutive-failure scan looks. Cheap bound on the query. */
 export const PROVIDER_BILLING_FAILURE_SCAN_LIMIT = 10;
 
+/** Structured, runtime-authored codes that already name a hard billing wall. */
+const BILLING_ERROR_CODES = new Set([PROVIDER_BILLING_EXHAUSTED_ERROR_CODE]);
+
+const TRANSIENT_ERROR_CODES = new Set([
+  "codex_transient_upstream",
+  "claude_transient_upstream",
+]);
+
 /**
- * Recoverable-by-waiting signals. Checked FIRST — see the bias note above.
+ * A reset clock: the provider told us when the window reopens, so waiting is the
+ * remedy. Matched first, and it beats any billing wording in the same message.
  *
- * Anthropic subscription exhaustion ("Claude usage limit reached — your limit
- * will reset at 5pm") reads a lot like credit exhaustion but *is* time-healing,
- * so it must land here and not in the hard set.
+ * This is what separates the two look-alike Claude messages — and why the adapter's
+ * own `claude_transient_upstream` label cannot be taken at face value here: its
+ * regex matches "out of usage credits" too, so a real hard wall arrives wearing a
+ * "transient" code (that mislabel is why the first cut of this guard never fired).
  */
+const RESET_CLOCK_PATTERNS: RegExp[] = [
+  /\bresets?\b[^\n]{0,24}?(\d|midnight|noon|tomorrow)/i,
+  /limit will reset/i,
+  /retry[\s_-]?after/i,
+];
+
+/** Recoverable-by-waiting signals. */
 const RATE_LIMIT_PATTERNS: RegExp[] = [
   /rate[\s_-]?limit/i,
   /\b429\b/,
-  /usage limit reached/i,
-  /limit will reset/i,
-  /\bresets? (at|in)\b/i,
-  /retry[\s_-]?after/i,
   /too many requests/i,
+  /usage limit reached/i,
+  /session limit/i,
+  /\b(5[\s-]?hour|weekly) limit reached/i,
+  /overloaded/i,
+  /\b(503|529)\b/,
 ];
 
 /**
  * Hard billing walls. No amount of waiting clears these.
+ *
+ * Only ever matched against TRUSTED text — see the trust boundary above.
  *
  * Sources: Claude CLI ("You're out of usage credits. Run /usage-credits ..."),
  * Anthropic API ("Your credit balance is too low to access the Anthropic API"),
@@ -80,63 +131,157 @@ const BILLING_PATTERNS: RegExp[] = [
   /payment required/i,
 ];
 
-const TRANSIENT_ERROR_CODES = new Set([
-  "codex_transient_upstream",
-  "claude_transient_upstream",
-]);
-
-function classifyText(text: string | null | undefined): RunFailureClass | null {
-  if (!text) return null;
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-
-  // Recoverable wins ties. A message carrying both a rate-limit phrase and a
-  // billing phrase is treated as the rate limit (cheap to retry, self-healing).
-  if (RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(trimmed))) {
-    return "provider_rate_limited";
-  }
-  if (BILLING_PATTERNS.some((pattern) => pattern.test(trimmed))) {
-    return "provider_billing_exhausted";
-  }
-  return null;
+function readNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
-function readResultJsonText(resultJson: unknown): string | null {
-  if (!resultJson || typeof resultJson !== "object") return null;
-  const record = resultJson as Record<string, unknown>;
-  const parts = [record.errorMessage, record.error, record.message, record.result, record.stderr]
-    .filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+/**
+ * True when the CLI terminated on an API error rather than on an agent turn.
+ *
+ * Both fields are written by the runtime, never by the agent. This is the shape a
+ * real credit exhaustion arrives in — verbatim from runs d4940cf4 / b824d2f1:
+ * `{subtype: "success", is_error: true, terminal_reason: "api_error", result:
+ * "You're out of usage credits. Run /usage-credits ..."}`. A healthy run that the
+ * runtime reaped reads `{is_error: false, terminal_reason: "completed"}` and its
+ * `result` is the agent's own report, so it stays untrusted.
+ */
+function isProviderAuthoredTerminal(resultJson: Record<string, unknown>): boolean {
+  if (resultJson.is_error !== true) return false;
+  const reason = readNonEmptyString(
+    resultJson.terminal_reason ?? resultJson.terminalReason,
+  )?.toLowerCase();
+  return reason === "api_error";
+}
+
+/** Bytes only the runtime/provider can have written. Eligible for a hard verdict. */
+function collectTrustedText(run: {
+  errorCode?: string | null;
+  resultJson?: unknown;
+}): string | null {
+  const parts: string[] = [];
+
+  const errorCode = readNonEmptyString(run.errorCode);
+  if (errorCode) parts.push(errorCode);
+
+  const resultJson = asRecord(run.resultJson);
+  if (resultJson && isProviderAuthoredTerminal(resultJson)) {
+    const result = readNonEmptyString(resultJson.result);
+    if (result) parts.push(result);
+
+    // The CLI's structured `errors` array, when it carries one.
+    const errors = Array.isArray(resultJson.errors) ? resultJson.errors : [];
+    for (const entry of errors) {
+      const text =
+        readNonEmptyString(entry) ??
+        readNonEmptyString(asRecord(entry)?.message) ??
+        readNonEmptyString(asRecord(entry)?.error);
+      if (text) parts.push(text);
+    }
+  }
+
   return parts.length > 0 ? parts.join("\n") : null;
 }
 
 /**
- * Classify a terminal run failure. Reads the persisted error code first (an
- * already-classified run is authoritative), then the free-text failure message
- * the adapter surfaced.
+ * Bytes the agent may have authored: the adapter's failure envelope wraps the
+ * agent's own final report, and stdout/stderr carry whatever its tools printed.
+ * Recoverable verdicts only.
+ */
+function collectUntrustedText(run: {
+  error?: string | null;
+  resultJson?: unknown;
+}): string | null {
+  const parts: string[] = [];
+
+  const error = readNonEmptyString(run.error);
+  if (error) parts.push(error);
+
+  const resultJson = asRecord(run.resultJson);
+  if (resultJson) {
+    for (const key of ["errorMessage", "error", "message", "result", "stderr", "stdout"]) {
+      const text = readNonEmptyString(resultJson[key]);
+      if (text) parts.push(text);
+    }
+  }
+
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
+function matchesAny(patterns: RegExp[], text: string): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+/** Recoverable signals. Safe to read from any provenance: the worst a forged one
+ *  buys is a retry we would already have run. */
+function classifyRecoverable(text: string | null): RunFailureClass | null {
+  if (!text) return null;
+  if (matchesAny(RESET_CLOCK_PATTERNS, text) || matchesAny(RATE_LIMIT_PATTERNS, text)) {
+    return "provider_rate_limited";
+  }
+  return null;
+}
+
+/**
+ * Classify a terminal run failure.
+ *
+ * Precedence: the structured billing code, then the provider's own words, then the
+ * adapter's transient label, then — for recoverable verdicts only — anything else.
  */
 export function classifyRunFailure(run: {
   errorCode?: string | null;
   error?: string | null;
   resultJson?: unknown;
 }): RunFailureClass {
-  if (run.errorCode === PROVIDER_BILLING_EXHAUSTED_ERROR_CODE) {
+  const errorCode = readNonEmptyString(run.errorCode);
+
+  // 1. A structured code an adapter already resolved. Runtime-authored, so it is
+  //    authoritative on its own.
+  if (errorCode && BILLING_ERROR_CODES.has(errorCode)) {
     return "provider_billing_exhausted";
   }
-  if (run.errorCode && TRANSIENT_ERROR_CODES.has(run.errorCode)) {
+
+  // 2. The provider's own terminal text. This outranks the transient code below on
+  //    purpose: the adapter's transient regex also matches "out of usage credits",
+  //    so a hard wall reaches us mislabelled `claude_transient_upstream`.
+  const trusted = collectTrustedText(run);
+  const recoverableFromTrusted = classifyRecoverable(trusted);
+  if (recoverableFromTrusted) return recoverableFromTrusted;
+  if (trusted && matchesAny(BILLING_PATTERNS, trusted)) {
+    return "provider_billing_exhausted";
+  }
+
+  // 3. The adapter's own transient classification, when it said nothing billing-ish.
+  if (errorCode && TRANSIENT_ERROR_CODES.has(errorCode)) {
     return "transient_upstream";
   }
 
-  return (
-    classifyText(run.error) ??
-    classifyText(readResultJsonText(run.resultJson)) ??
-    classifyText(run.errorCode) ??
-    "unclassified"
-  );
+  // 4. Agent-reachable bytes. Recoverable or nothing — never a pause.
+  return classifyRecoverable(collectUntrustedText(run)) ?? "unclassified";
 }
 
 /** True when retrying this failure cannot possibly succeed without human action. */
 export function isUnrecoverableRunFailure(failureClass: RunFailureClass): boolean {
   return failureClass === "provider_billing_exhausted";
+}
+
+/**
+ * The provider's own words for this failure, or null if it wrote none.
+ *
+ * Never the agent's: quoting the agent's report back to an operator as "the
+ * provider error" is how a healthy agent's success summary ended up presented as
+ * a failure (TON-3281).
+ */
+export function readProviderAuthoredFailureText(run: { resultJson?: unknown }): string | null {
+  const resultJson = asRecord(run.resultJson);
+  if (!resultJson || !isProviderAuthoredTerminal(resultJson)) return null;
+  return readNonEmptyString(resultJson.result);
 }
 
 /**
