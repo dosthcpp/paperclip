@@ -26,9 +26,10 @@
  *
  *  - TRUSTED — `errorCode` (an enum only adapter code writes), and the provider's
  *    own terminal text, unlocked only by the runtime-authored structured shape
- *    `is_error === true && terminal_reason === "api_error"`. That shape means the
- *    API call itself failed, so the run had no agent turn to author `result` with.
- *    Only these bytes can produce a hard verdict.
+ *    `is_error === true && terminal_reason ∈ PROVIDER_AUTHORED_TERMINALS`. Those
+ *    reasons mean the provider refused before an agent turn could run, so there was
+ *    no agent turn to author `result` with. Only these bytes can produce a hard
+ *    verdict. See PROVIDER_AUTHORED_TERMINALS for why the set is exactly two values.
  *
  *  - UNTRUSTED — everything else: `error`, an ungated `result`, `stdout`, `stderr`.
  *    These may only ever yield a *recoverable* verdict, which merely preserves the
@@ -143,12 +144,68 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 /**
- * True when the CLI terminated on an API error rather than on an agent turn.
+ * Terminal reasons that mean the run died *before or instead of* an agent turn, so
+ * `result` holds the provider's own words rather than the agent's final report.
  *
- * Both fields are written by the runtime, never by the agent. This is the shape a
- * real credit exhaustion arrives in — verbatim from runs d4940cf4 / b824d2f1:
- * `{subtype: "success", is_error: true, terminal_reason: "api_error", result:
- * "You're out of usage credits. Run /usage-credits ..."}`. A healthy run that the
+ * This set is the trust boundary's gate. It must stay narrow: every value added
+ * here is a new path by which text can earn a hard verdict, and a hard verdict
+ * pauses an agent.
+ *
+ * The CLI's full enum (extracted from the 2.1.209 release binary) is:
+ *
+ *   api_error, blocking_limit, rapid_refill_breaker, budget_exhausted,
+ *   prompt_too_long, image_error, model_error, turn_setup_failed,
+ *   malformed_tool_use_exhausted, structured_output_retry_exhausted,
+ *   tool_deferred, tool_deferred_unavailable, aborted_streaming, aborted_tools,
+ *   stop_hook_prevented, hook_stopped, max_turns, background_requested, completed
+ *
+ * Only two are unlocked, because only two can carry a provider billing wall:
+ *
+ *  - `api_error` — the API call itself failed. The original TON-3278 shape, seen
+ *    verbatim in runs d4940cf4 / b824d2f1: `{is_error: true, terminal_reason:
+ *    "api_error", result: "You're out of usage credits. Run /usage-credits ..."}`.
+ *
+ *  - `blocking_limit` — a provider limit blocked the turn outright (TON-3327).
+ *    Both Claude limit messages land here: the hard credit wall ("out of usage
+ *    credits") and the soft session wall ("session limit · resets 7pm"). They are
+ *    told apart downstream by the reset clock, not here — RESET_CLOCK_PATTERNS is
+ *    matched before BILLING_PATTERNS, so the soft one stays recoverable. Unlocking
+ *    this therefore widens coverage without adding a false-pause path. Leaving it
+ *    locked was the whole defect: a credit wall arriving as `blocking_limit` kept
+ *    the adapter's mislabelled `claude_transient_upstream` verdict (its regex
+ *    matches "out of usage credits" too), read as recoverable, and the dispatch
+ *    hot-loop kept burning money — DEFECT 2 re-entering under a different enum.
+ *
+ * Deliberately NOT unlocked:
+ *
+ *  - `budget_exhausted` — a CLI-*local* spend cap, not a provider refusal. The
+ *    2.1.209 binary carries no credit/billing wording for it, so unlocking it
+ *    could only ever fire on text that matched BILLING_PATTERNS by accident. A
+ *    local cap that deserves a pause is a separate policy decision, not this one.
+ *
+ *  - `rapid_refill_breaker` — an autocompact guard ("rapid-refill breaker tripped:
+ *    N consecutive refills within < N turns each"), i.e. a context-management
+ *    circuit breaker. Nothing to do with billing.
+ *
+ *  - `hook_stopped` / `stop_hook_prevented` — the text is hook output, and hooks are
+ *    agent-writable. Unlocking these would hand the agent a pen inside the trust
+ *    boundary, which is precisely what TON-3281 taught us not to do.
+ *
+ *  - `aborted_streaming` / `aborted_tools` / `tool_deferred*` / `max_turns` /
+ *    `completed` / `background_requested` — a turn ran, so `result` may be the
+ *    agent's own prose. Untrusted by construction.
+ *
+ *  - `prompt_too_long` / `image_error` / `model_error` / `turn_setup_failed` /
+ *    `malformed_tool_use_exhausted` / `structured_output_retry_exhausted` — runtime-
+ *    authored, so unlocking them would be *safe*, but none is a billing wall. They
+ *    are left out to keep the gate at the minimum that the evidence supports.
+ */
+const PROVIDER_AUTHORED_TERMINALS = new Set(["api_error", "blocking_limit"]);
+
+/**
+ * True when the CLI terminated on a provider refusal rather than on an agent turn.
+ *
+ * Both fields are written by the runtime, never by the agent. A healthy run that the
  * runtime reaped reads `{is_error: false, terminal_reason: "completed"}` and its
  * `result` is the agent's own report, so it stays untrusted.
  */
@@ -156,8 +213,8 @@ function isProviderAuthoredTerminal(resultJson: Record<string, unknown>): boolea
   if (resultJson.is_error !== true) return false;
   const reason = readNonEmptyString(
     resultJson.terminal_reason ?? resultJson.terminalReason,
-  )?.toLowerCase();
-  return reason === "api_error";
+  );
+  return reason !== null && PROVIDER_AUTHORED_TERMINALS.has(reason.toLowerCase());
 }
 
 /** Bytes only the runtime/provider can have written. Eligible for a hard verdict. */
