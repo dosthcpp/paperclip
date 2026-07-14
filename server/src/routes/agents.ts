@@ -2819,6 +2819,20 @@ export function agentRoutes(
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
+
+    // TON-3278: keep `errorReason` coherent with `status`. The runtime already
+    // holds the invariant "status != error => errorReason is null"
+    // (finalizeAgentStatus clears it on every non-error outcome), so a PATCH that
+    // moves the agent out of `error` must not leave a stale reason behind — that
+    // stale string is exactly what made an idle agent read as still-broken.
+    // An explicit `errorReason` in the body always wins.
+    if (
+      !hasOwn(patchData, "errorReason") &&
+      typeof patchData.status === "string" &&
+      patchData.status !== "error"
+    ) {
+      patchData.errorReason = null;
+    }
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {

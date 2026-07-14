@@ -103,6 +103,11 @@ export const updateAgentSchema = createAgentSchema
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
+    // TON-3278: `errorReason` used to be absent here, so zod silently stripped it
+    // from the body and `{"status":"idle","errorReason":null}` returned 200 with
+    // the stale error string still on the record. Declaring it makes the PATCH
+    // honour the field; `null` clears it.
+    errorReason: z.string().max(500).nullable().optional(),
   });
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;

@@ -61,6 +61,14 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
+import {
+  buildProviderBillingPauseReason,
+  countLeadingProviderBillingFailures,
+  decideProviderBillingPause,
+  PROVIDER_BILLING_FAILURE_SCAN_LIMIT,
+  PROVIDER_BILLING_PAUSE_REASON,
+  readProviderAuthoredFailureText,
+} from "./run-failure-class.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
@@ -9678,6 +9686,108 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /** The agent's most recent terminal runs, newest first. */
+  async function listRecentTerminalRunsForAgent(agentId: string) {
+    return db
+      .select({
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(PROVIDER_BILLING_FAILURE_SCAN_LIMIT);
+  }
+
+  /**
+   * Hot-loop guard (TON-3278). A credit-exhausted agent stays dispatchable —
+   * `error` is an invokable status — so `reconcileStrandedAssignedIssues` picks
+   * its issue back up every scheduler tick and burns another run on the same
+   * wall. Pausing is what actually stops it: `paused` is in
+   * DIRECT_NON_INVOKABLE_STATUSES, so every dispatch path (timer wakes,
+   * scheduled retries, stranded-issue recovery) gates on it at once.
+   *
+   * Returns true when the agent was paused, meaning the caller must not write
+   * an `error` status over it.
+   */
+  async function pauseAgentOnHardProviderFailure(agent: typeof agents.$inferSelect) {
+    // Trust boundary (TON-3314): the verdict is drawn from the persisted runs'
+    // structured evidence and never from `finalizeAgentStatus`'s failureReason.
+    // That string is the adapter's envelope wrapped around the agent's own final
+    // report (TON-3281), so an agent that merely writes about running out of
+    // credits could otherwise pause itself.
+    //
+    // The just-finalized run is already persisted terminal, so the scan sees it.
+    const recentRuns = await listRecentTerminalRunsForAgent(agent.id);
+    const consecutive = countLeadingProviderBillingFailures(recentRuns);
+    if (!decideProviderBillingPause({ consecutiveFailures: consecutive })) return false;
+
+    const providerError = readProviderAuthoredFailureText(recentRuns[0] ?? {});
+    const pauseReason = buildProviderBillingPauseReason(providerError);
+    const updated = await db
+      .update(agents)
+      .set({
+        status: "paused",
+        pauseReason: PROVIDER_BILLING_PAUSE_REASON,
+        pausedAt: new Date(),
+        errorReason: truncateAgentErrorReason(pauseReason),
+        lastHeartbeatAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(agents.id, agent.id))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) return false;
+
+    logger.error(
+      {
+        agentId: agent.id,
+        agentName: agent.name,
+        companyId: agent.companyId,
+        consecutiveFailures: consecutive,
+      },
+      "agent paused: provider credit balance exhausted (retrying cannot clear this)",
+    );
+
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId: agent.id,
+      action: "agent.paused",
+      entityType: "agent",
+      entityId: agent.id,
+      details: {
+        pauseReason: PROVIDER_BILLING_PAUSE_REASON,
+        consecutiveFailures: consecutive,
+        failureReason: truncateAgentErrorReason(providerError),
+      },
+    });
+
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "agent.status",
+      payload: {
+        agentId: updated.id,
+        status: updated.status,
+        lastHeartbeatAt: updated.lastHeartbeatAt
+          ? new Date(updated.lastHeartbeatAt).toISOString()
+          : null,
+        outcome: "failed",
+        pauseReason: PROVIDER_BILLING_PAUSE_REASON,
+      },
+    });
+
+    return true;
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
@@ -9699,6 +9809,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : outcome === "succeeded" || outcome === "cancelled"
           ? "idle"
           : "error";
+
+    // Only when nothing else is in flight: a still-running run means the agent
+    // is not actually walled off, so leave it dispatchable.
+    if (nextStatus === "error" && (await pauseAgentOnHardProviderFailure(existing))) {
+      return;
+    }
 
     const updated = await db
       .update(agents)
