@@ -2321,8 +2321,16 @@ function didAutomaticRecoveryFail(
 
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
+  // A process-loss retry inherits its parent run's issue context, so a failed
+  // recovery run followed by a failed process-loss retry must still count as a
+  // failed recovery. Without this look-through the recovery loop never
+  // terminates when every run dies before finishing (TON-3216 73-run storm).
+  const effectiveRetryReason =
+    latestRetryReason === "process_lost"
+      ? readNonEmptyString(latestContext.processLostPriorRetryReason) ?? latestRetryReason
+      : latestRetryReason;
   return (
-    latestRetryReason === expectedRetryReason &&
+    effectiveRetryReason === expectedRetryReason &&
     UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     )
@@ -7739,6 +7747,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason: "process_lost",
+      // Preserve the recovery reason this retry stands in for, so that
+      // didAutomaticRecoveryFail can see through interleaved process-loss
+      // retries; otherwise each recovery cycle resets the guard and a dying
+      // daemon produces an unbounded retry/recovery loop (TON-3216).
+      processLostPriorRetryReason: readNonEmptyString(contextSnapshot.retryReason) ?? null,
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 

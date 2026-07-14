@@ -1432,6 +1432,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
+  it("blocks the issue when a process-loss retry standing in for a failed continuation recovery dies, instead of queueing another continuation", async () => {
+    // TON-3216 regression: continuation recovery dies -> process-loss retry dies ->
+    // without the look-through, promote queues a fresh continuation with a reset
+    // retry counter and the loop never terminates (73-run storm).
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      contextSnapshot: {
+        wakeReason: "process_lost_retry",
+        retryReason: "process_lost",
+        processLostPriorRetryReason: "issue_continuation_needed",
+        retryOfRunId: randomUUID(),
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const blockedIssue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const issue = rows[0] ?? null;
+        return issue?.status === "blocked" ? issue : null;
+      })
+    );
+    expect(blockedIssue?.status).toBe("blocked");
+    expect(blockedIssue?.executionRunId).toBeNull();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+
+    // The only follow-up allowed is the one-shot stranded-issue escalation wake;
+    // queueing another continuation (or process-loss retry) here is the storm.
+    const followUps = runs.filter((row) => row.id !== runId);
+    for (const followUp of followUps) {
+      const context = followUp.contextSnapshot as Record<string, unknown>;
+      expect(context.wakeReason).toBe("source_scoped_recovery_action");
+      expect(context.retryReason).toBeUndefined();
+    }
+  });
+
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
     const sourceIssueId = randomUUID();
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
