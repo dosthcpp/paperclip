@@ -168,7 +168,10 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
-function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
+// Exported for the stranded-issue wake queue (TON-3292): an issue parked on a
+// future monitor is WAITING, not stranded, and both reconcilers must agree on
+// what "waiting" means or they will fight each other over the same issue.
+export function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
 

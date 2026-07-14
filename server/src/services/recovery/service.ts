@@ -53,6 +53,7 @@ import {
 } from "./origins.js";
 import {
   classifyIssueGraphLiveness,
+  hasScheduledMonitor,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
 import {
@@ -2434,7 +2435,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
-  async function reconcileStrandedAssignedIssues() {
+  async function reconcileStrandedAssignedIssues(now = new Date()) {
+    const nowMs = now.getTime();
     const candidates = await db
       .select()
       .from(issues)
@@ -2468,6 +2470,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const agent = await getAgent(agentId);
       if (!agent || agent.companyId !== issue.companyId || !isAgentInvokable(agent)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // TON-3292: an issue parked on a future monitor is WAITING, not stranded.
+      // hasActiveExecutionPath() only knows about live runs and deferred wakes, so
+      // without this the wake queue judged every monitor-parked issue stranded --
+      // waking the agent months before the window opened and then escalating the
+      // issue to `blocked`, where its monitor could never fire again.
+      if (hasScheduledMonitor(issue, nowMs)) {
         result.skipped += 1;
         continue;
       }

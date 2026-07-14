@@ -194,6 +194,17 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+// TON-3292: a monitor must be able to fire from whatever status the issue was
+// parked in. Restricting this to the active statuses meant a "wake me when the
+// window opens" carrier issue (parked in `backlog`/`todo`) never fired at all --
+// silently, with no error and no log.
+//
+// `blocked` is included deliberately: listIssueBlockedInboxAttentionMap already
+// branches on `status === "blocked" && !hasMonitor` (services/issues.ts), i.e. a
+// blocked issue WITH a scheduled monitor is an intended state -- it is waiting on
+// a timed re-check, not on a human. Excluding it is what made `blocked` a monitor
+// graveyard. Terminal statuses (done/cancelled) stay excluded.
+const MONITOR_DISPATCHABLE_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -3435,7 +3446,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
-          inArray(issues.status, ["in_progress", "in_review"]),
+          inArray(issues.status, MONITOR_DISPATCHABLE_ISSUE_STATUSES),
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -3463,7 +3474,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
               sql`${issues.assigneeAgentId} is not null`,
-              inArray(issues.status, ["in_progress", "in_review"]),
+              inArray(issues.status, MONITOR_DISPATCHABLE_ISSUE_STATUSES),
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),

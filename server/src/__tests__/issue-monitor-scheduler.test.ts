@@ -137,14 +137,15 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "todo" | "backlog";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
+    nextCheckAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    const nextCheckAt = new Date("2026-04-11T12:30:00.000Z");
+    const nextCheckAt = input?.nextCheckAt ?? new Date("2026-04-11T12:30:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     const monitorAttemptCount = input?.monitorAttemptCount ?? 0;
@@ -446,5 +447,173 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId));
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
+  });
+
+  // ---------------------------------------------------------------------------
+  // TON-3292 — the "time-delayed carrier" pattern: an issue parked on a future
+  // monitor so it wakes when a window opens (e.g. TON-3108, patent FTO order
+  // window 2026-10). Two independent defects made every parking status unsafe:
+  //
+  //   A. tickDueIssueMonitors() selects only status in (in_progress, in_review),
+  //      so a monitor parked on backlog/todo NEVER fires — silently, no error.
+  //   B. reconcileStrandedAssignedIssues() has no monitor condition at all, and
+  //      hasActiveExecutionPath() does not count a parked monitor as a live path.
+  //      So an in_progress issue waiting on a future monitor is judged "stranded"
+  //      -> spuriously woken -> and on the next tick escalated to `blocked`.
+  //
+  // Together they are a pincer: backlog/todo => never fires (A); in_progress =>
+  // dragged to blocked (B); and `blocked` is not in A's status list, so the
+  // monitor is then dead permanently. There was NO safe status to wait in.
+  // ---------------------------------------------------------------------------
+
+  // Far future on purpose: reconcileStrandedAssignedIssues() has no injected
+  // clock, so a fixture dated 2026-10 would quietly become a PAST date and stop
+  // exercising the future-monitor path at all.
+  const FAR_FUTURE = new Date("2030-01-01T00:00:00.000Z");
+
+  async function seedTerminalRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    context?: Record<string, unknown>;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      // "advanced" => isProductiveContinuationRun() is true, i.e. the agent's
+      // last run genuinely made progress and then parked on the monitor.
+      livenessState: "advanced",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: input.issueId, ...(input.context ?? {}) },
+    });
+    return runId;
+  }
+
+  it("TON-3292/A: fires a due monitor parked on a `backlog` carrier issue", async () => {
+    const { issueId, agentId } = await seedFixture({ issueStatus: "backlog" });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    // Pre-fix this is 0: the monitor is due, but the status filter hides it.
+    expect(result.enqueued).toBe(1);
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_due");
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(issue.monitorAttemptCount).toBe(1);
+  });
+
+  it("TON-3292/A: fires a due monitor parked on a `todo` carrier issue", async () => {
+    const { agentId } = await seedFixture({ issueStatus: "todo" });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(result.enqueued).toBe(1);
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_due");
+  });
+
+  it("TON-3292/B: does not wake an `in_progress` issue that is parked on a FUTURE monitor", async () => {
+    const { companyId, agentId, issueId } = await seedFixture({ nextCheckAt: FAR_FUTURE });
+    await seedTerminalRun({ companyId, agentId, issueId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Pre-fix continuationRequeued === 1: the issue is waiting on its monitor,
+    // but the wake queue cannot see monitors, so it calls it stranded and wakes
+    // the agent -- every heartbeat, months before the window opens.
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("in_progress");
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(FAR_FUTURE.toISOString());
+  });
+
+  // NEGATIVE CONTROL. The tempting simplification of the fix is to skip any issue
+  // that merely HAS a monitor (`issue.monitorNextCheckAt !== null`) instead of one
+  // whose monitor can still fire. That reads fine and passes every test above --
+  // and it turns a dead monitor into a permanent mask: a genuinely stranded issue
+  // whose monitor is stale or attempt-exhausted would never be recovered again.
+  // These two cases exist so that shortcut cannot ship. A monitor that CANNOT fire
+  // is not a waiting path.
+  it("TON-3292/B: a PAST-due monitor does not mask a genuinely stranded issue", async () => {
+    const { companyId, agentId, issueId } = await seedFixture({
+      nextCheckAt: new Date("2020-01-01T00:00:00.000Z"),
+    });
+    await seedTerminalRun({ companyId, agentId, issueId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Still stranded, still recovered: the monitor is overdue, not pending.
+    expect(result.continuationRequeued).toBe(1);
+  });
+
+  it("TON-3292/B: an attempt-exhausted monitor does not mask a genuinely stranded issue", async () => {
+    const { companyId, agentId, issueId } = await seedFixture({
+      nextCheckAt: FAR_FUTURE,
+      monitorAttemptCount: 3,
+      monitor: { maxAttempts: 3 },
+    });
+    await seedTerminalRun({ companyId, agentId, issueId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // nextCheckAt is in the future, but the monitor has no attempts left, so it
+    // will never fire -- that is not "waiting", that is stranded.
+    expect(result.continuationRequeued).toBe(1);
+  });
+
+  it("TON-3292/B: does not escalate a FUTURE-monitor carrier to `blocked` (which would kill the monitor for good)", async () => {
+    const { companyId, agentId, issueId } = await seedFixture({ nextCheckAt: FAR_FUTURE });
+    // A prior spurious continuation recovery is what trips
+    // isRepeatedProductiveContinuationRecovery() on the following tick.
+    await seedTerminalRun({
+      companyId,
+      agentId,
+      issueId,
+      context: {
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // Pre-fix this is "blocked" -- and `blocked` is not in tickDueIssueMonitors'
+    // status list, so the carrier's monitor would then never fire again. This is
+    // the trap in the obvious remedy "just promote the carrier to in_progress".
+    expect(issue.status).toBe("in_progress");
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(FAR_FUTURE.toISOString());
   });
 });
