@@ -19,6 +19,14 @@ export interface RunProcessResult {
   stderr: string;
   pid: number | null;
   startedAt: string | null;
+  /**
+   * True when the runtime itself terminated the process after observing the adapter's
+   * terminal result event (see TerminalResultCleanupOptions). The resulting exit code
+   * (typically 143 = SIGTERM) then describes our own kill, not the run's outcome, so it
+   * must not be read as evidence of failure. Absent/false means the exit code reflects
+   * the process's own fate and is authoritative.
+   */
+  terminalResultCleanupKilled?: boolean;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -3015,6 +3023,7 @@ export async function runChildProcess(
                 stderr,
                 pid: child.pid ?? null,
                 startedAt,
+                terminalResultCleanupKilled: terminalCleanupStarted,
               });
               });
           });

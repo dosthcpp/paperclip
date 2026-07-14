@@ -2,6 +2,7 @@ import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
+  asBoolean,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -9,10 +10,19 @@ import {
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
+// Subscription exhaustion ("out of usage credits", "hit your session limit") is what the CLI
+// actually says when an account runs dry, but it was absent from this list. Those runs were
+// only ever classified transient by accident: the regex's loose `rate[-\s]?limit` alternative
+// matched `rateLimitType` inside the CLI's rate_limit_info telemetry, which is present even on
+// a healthy account. With that false positive removed (see buildClaudeTransientHaystack), the
+// wording has to be matched on purpose. Anchored to the CLI's own result text, never stdout.
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|out\s+of\s+usage\s+credits|session\s+limit(?:\s+reached)?|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+// Feeds retryNotBefore. Credits/session-limit messages carry a "· resets 7pm (Asia/Seoul)"
+// suffix; without these alternatives they parsed no reset time and the run was retried with no
+// backoff at all -- the dispatch hot loop (TON-3278).
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|out\s+of\s+usage\s+credits|session\s+limit(?:\s+reached)?|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -135,7 +145,17 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
+  // A CLI that emitted a terminal result event was, by definition, logged in. Scanning its
+  // stdout transcript for auth prose only lets an agent that reads a 401 or writes the word
+  // "unauthorized" convict its own healthy run of an auth failure -- which is exactly how a
+  // $2.40, 8-minute, 342KB run got stamped `claude_auth_required` (TON-3281).
+  const hasTerminalResult = input.parsed !== null;
+  const messages = [
+    resultText,
+    ...extractClaudeErrorMessages(input.parsed ?? {}),
+    ...(hasTerminalResult ? [] : [input.stdout]),
+    input.stderr,
+  ]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -146,6 +166,34 @@ export function detectClaudeLoginRequired(input: {
     requiresLogin,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
+}
+
+/**
+ * The authoritative failure verdict for a claude_local run.
+ *
+ * Two inputs, in strict precedence:
+ *
+ *  - `is_error` on the CLI's terminal `result` event. Runtime-authored, structured, and
+ *    never suppressed: it is an unconditional OR. Credit exhaustion reports
+ *    `{subtype: "success", is_error: true, terminal_reason: "api_error"}`, so this is what
+ *    keeps a genuine billing failure red even when we reaped the process ourselves.
+ *
+ *  - The process exit code -- but only when we did not cause it. We SIGTERM the CLI once it
+ *    emits its terminal result (terminalResultCleanup), landing exit 143. Reading our own
+ *    kill back as the run's verdict is what stamped successful agents `status=error` and
+ *    spilled their final reports into `errorReason` (TON-3281).
+ *
+ * Deliberately reads no prose. The agent authors its own stdout and result text; a verdict
+ * derived from those bytes lets an agent exculpate or convict itself.
+ */
+export function isClaudeRunFailed(input: {
+  parsed: Record<string, unknown> | null;
+  exitCode: number | null;
+  terminalResultCleanupKilled?: boolean;
+}): boolean {
+  const parsedIsError = input.parsed ? asBoolean(input.parsed.is_error, false) : false;
+  const exitCodeIsAuthoritative = !input.terminalResultCleanupKilled;
+  return (exitCodeIsAuthoritative && (input.exitCode ?? 0) !== 0) || parsedIsError;
 }
 
 export function describeClaudeFailure(parsed: Record<string, unknown>): string | null {
@@ -247,11 +295,24 @@ function buildClaudeTransientHaystack(input: {
   const parsed = input.parsed ?? null;
   const resultText = parsed ? asString(parsed.result, "") : "";
   const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
+
+  // Raw stdout is the full stream-json transcript: every tool result, every file the agent
+  // read, every line it wrote -- plus the CLI's own `rate_limit_info` telemetry, which
+  // carries a `rateLimitType` key even when the account is healthy (`status:
+  // allowed_warning`). Scanning it for failure prose is self-poisoning: an agent that reads
+  // a script handling HTTP 429, or merely reports on a rate-limit incident, classifies its
+  // own run as a transient upstream failure and earns a retry (TON-3281).
+  //
+  // Once the CLI has given us a terminal result we classify only from bytes it authored:
+  // its own result text, its structured errors, and stderr. Raw stdout stays in the haystack
+  // only in the no-terminal-result case, where the CLI died before reporting and its error
+  // text may exist nowhere else.
+  const hasTerminalResult = parsed !== null;
   return [
     input.errorMessage ?? "",
     resultText,
     ...parsedErrors,
-    input.stdout ?? "",
+    hasTerminalResult ? "" : input.stdout ?? "",
     input.stderr ?? "",
   ]
     .join("\n")
