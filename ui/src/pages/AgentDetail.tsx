@@ -7,6 +7,7 @@ import {
   type ClaudeLoginResult,
   type AgentPermissionUpdate,
 } from "../api/agents";
+import { builtInAgentsApi, type BuiltInManagedResourceKind } from "../api/builtInAgents";
 import { companySkillsApi } from "../api/companySkills";
 import { budgetsApi } from "../api/budgets";
 import { heartbeatsApi } from "../api/heartbeats";
@@ -14,14 +15,16 @@ import { instanceSettingsApi } from "../api/instanceSettings";
 import { ApiError } from "../api/client";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { activityApi } from "../api/activity";
+import { accessApi } from "../api/access";
 import { issuesApi } from "../api/issues";
+import { projectsApi } from "../api/projects";
 import { usePanel } from "../context/PanelContext";
 import { useSidebar } from "../context/SidebarContext";
 import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
-import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
+import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
 import { PageTabBar } from "../components/PageTabBar";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
@@ -32,15 +35,20 @@ import { MarkdownEditor } from "../components/MarkdownEditor";
 import { assetsApi } from "../api/assets";
 import { getUIAdapter, buildTranscript, onAdapterChange } from "../adapters";
 import { StatusBadge } from "../components/StatusBadge";
-import { agentStatusDot, agentStatusDotDefault } from "../lib/status-colors";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { CopyText } from "../components/CopyText";
 import { EntityRow } from "../components/EntityRow";
 import { MembershipAction } from "../components/MembershipAction";
+import { StarToggle } from "../components/StarToggle";
 import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { RunButton, PauseResumeButton } from "../components/AgentActionButtons";
+import { AgentActionButtons } from "../components/AgentActionButtons";
+import { InlineBanner } from "../components/InlineBanner";
+import { BuiltInAgentBadge } from "../components/BuiltInAgentBadges";
+import { BuiltInBundlePanel } from "../components/BuiltInBundlePanel";
+import { ConfigureBuiltInAgentModal } from "../components/ConfigureBuiltInAgentModal";
 import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
+import { TrustPresetSection } from "../components/TrustPresetSection";
 import { FileTree, buildFileTree } from "../components/FileTree";
 import { ScrollToBottom } from "../components/ScrollToBottom";
 import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallout";
@@ -50,18 +58,11 @@ import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { describeRunRetryState } from "../lib/runRetryState";
-import { buildDuplicateAgentPayload, duplicateAgentName, type DuplicateInstructionsBundle } from "../lib/duplicate-agent-payload";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import {
-  MoreHorizontal,
   CheckCircle2,
   XCircle,
   Clock,
@@ -69,7 +70,6 @@ import {
   Loader2,
   Slash,
   RotateCcw,
-  Trash2,
   Plus,
   Key,
   Eye,
@@ -80,6 +80,7 @@ import {
   ArrowLeft,
   HelpCircle,
   FolderOpen,
+  AlertTriangle,
 } from "lucide-react";
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -89,10 +90,6 @@ import { RunTranscriptView, type TranscriptMode } from "../components/transcript
 import {
   isUuidLike,
   type Agent,
-  type AgentInstructionsBundle,
-  type AgentInstructionsFileSummary,
-  type AgentSkillEntry,
-  type AgentSkillSnapshot,
   type AgentDetail as AgentDetailRecord,
   type BudgetPolicySummary,
   type HeartbeatRun,
@@ -100,52 +97,26 @@ import {
   type AgentRuntimeState,
   type LiveEvent,
   type WorkspaceOperation,
+  isResponsibleUserDenialCode,
+  responsibleUserLabel,
 } from "@paperclipai/shared";
+import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
+import { RunWorkspaceRecoverySurface } from "../components/RunWorkspaceRecoverySurface";
+import { buildPermissionsForTrustPreset, getTrustPreset } from "../lib/trust-policy-ui";
 import { redactHomePathUserSegments, redactHomePathUserSegmentsInValue } from "@paperclipai/adapter-utils";
 import { agentRouteRef } from "../lib/utils";
 import {
+  isStarred,
   resourceMembershipState,
   useResourceMembershipMutation,
   useResourceMemberships,
 } from "../hooks/useResourceMemberships";
-import {
-  applyAgentSkillSnapshot,
-  arraysEqual,
-  isReadOnlyUnmanagedSkillEntry,
-} from "../lib/agent-skills-state";
-
-async function loadDuplicateInstructionsBundle(
-  agentId: string,
-  companyId?: string,
-): Promise<DuplicateInstructionsBundle | null> {
-  const bundle = await agentsApi.instructionsBundle(agentId, companyId);
-  const files: Record<string, string> = {};
-
-  for (const summary of bundle.files) {
-    const path = duplicateInstructionFilePath(bundle, summary);
-    if (!path) continue;
-    const file = await agentsApi.instructionsFile(agentId, summary.path, companyId);
-    files[path] = file.content;
-  }
-
-  const entryFile = Object.prototype.hasOwnProperty.call(files, bundle.entryFile)
-    ? bundle.entryFile
-    : Object.keys(files)[0] ?? "AGENTS.md";
-  return Object.keys(files).length > 0 ? { entryFile, files } : null;
-}
-
-function duplicateInstructionFilePath(
-  _bundle: AgentInstructionsBundle,
-  summary: AgentInstructionsFileSummary,
-): string | null {
-  if (summary.deprecated || summary.virtual) return null;
-  return summary.path;
-}
+import { Badge } from "@/components/ui/badge";
 
 const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string }> = {
   succeeded: { icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
   failed: { icon: XCircle, color: "text-red-600 dark:text-red-400" },
-  running: { icon: Loader2, color: "text-cyan-600 dark:text-cyan-400" },
+  running: { icon: Loader2, color: "text-blue-600 dark:text-blue-400" }, // Gallery feedback r1: running = status blue, not cyan.
   queued: { icon: Clock, color: "text-yellow-600 dark:text-yellow-400" },
   scheduled_retry: { icon: Clock, color: "text-sky-600 dark:text-sky-400" },
   timed_out: { icon: Timer, color: "text-orange-600 dark:text-orange-400" },
@@ -159,6 +130,12 @@ const SECRET_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const COMMAND_ENV_KEY_RE = /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+
+function formatOrgChainHealthPath(agent: AgentDetailRecord) {
+  return agent.orgChainHealth?.fullChain
+    .map((entry) => `${entry.name}${entry.status !== "active" && entry.status !== "idle" ? ` (${entry.status})` : ""}`)
+    .join(" -> ") ?? agent.name;
+}
 
 function redactPathText(value: string, censorUsernameInLogs: boolean) {
   return redactHomePathUserSegments(value, { enabled: censorUsernameInLogs });
@@ -200,6 +177,17 @@ function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boole
 
 function isMarkdown(pathValue: string) {
   return pathValue.toLowerCase().endsWith(".md");
+}
+
+function shouldUseMarkdownInstructionsEditor(input: {
+  selectedFileExists: boolean;
+  selectedPath: string;
+  detail?: { markdown?: boolean } | null;
+  summary?: { markdown?: boolean } | null;
+}) {
+  const metadataMarkdown = input.detail?.markdown ?? input.summary?.markdown;
+  if (typeof metadataMarkdown === "boolean") return metadataMarkdown;
+  return isMarkdown(input.selectedPath);
 }
 
 function formatEnvForDisplay(envValue: unknown, censorUsernameInLogs: boolean): string {
@@ -330,7 +318,11 @@ function runMetrics(run: HeartbeatRun) {
   };
 }
 
-type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
+export type RunLogChunk = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  chunk: string;
+};
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -341,6 +333,22 @@ function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+export function buildHeartbeatProgressLogLine(
+  payload: Record<string, unknown>,
+  fallbackTimestamp: string,
+): RunLogChunk | null {
+  const message = asNonEmptyString(payload.message);
+  if (!message) return null;
+  const phase = asNonEmptyString(payload.phase);
+  const ts = asNonEmptyString(payload.updatedAt) ?? fallbackTimestamp;
+  const chunk = phase ? `[${phase}] ${message}` : message;
+  return { ts, stream: "system", chunk };
+}
+
+export function heartbeatProgressLogLineKey(line: RunLogChunk): string {
+  return `${line.ts}\u0000${line.stream}\u0000${line.chunk}`;
 }
 
 export function RunInvocationCard({
@@ -460,6 +468,8 @@ function workspaceOperationPhaseLabel(phase: WorkspaceOperation["phase"]) {
   switch (phase) {
     case "worktree_prepare":
       return "Worktree setup";
+    case "workspace_config_freshness":
+      return "Config freshness";
     case "workspace_provision":
       return "Provision";
     case "workspace_teardown":
@@ -478,7 +488,7 @@ function workspaceOperationStatusTone(status: WorkspaceOperation["status"]) {
     case "failed":
       return "border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-300";
     case "running":
-      return "border-cyan-500/20 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300";
+      return "border-blue-500/20 bg-blue-500/10 text-blue-700 dark:text-blue-300";
     case "skipped":
       return "border-yellow-500/20 bg-yellow-500/10 text-yellow-700 dark:text-yellow-300";
     default:
@@ -488,14 +498,14 @@ function workspaceOperationStatusTone(status: WorkspaceOperation["status"]) {
 
 function WorkspaceOperationStatusBadge({ status }: { status: WorkspaceOperation["status"] }) {
   return (
-    <span
+    <Badge variant="outline"
       className={cn(
-        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium capitalize",
+        "text-(length:--text-micro) capitalize",
         workspaceOperationStatusTone(status),
       )}
     >
       {status.replace("_", " ")}
-    </span>
+    </Badge>
   );
 }
 
@@ -523,7 +533,7 @@ function WorkspaceOperationLogViewer({
     <div className="space-y-2">
       <button
         type="button"
-        className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        className="text-(length:--text-micro) text-muted-foreground underline underline-offset-2 hover:text-foreground"
         onClick={() => setOpen((value) => !value)}
       >
         {open ? "Hide full log" : "Show full log"}
@@ -591,7 +601,7 @@ function WorkspaceOperationsSection({
               <div className="flex flex-wrap items-center gap-2">
                 <div className="text-sm font-medium">{workspaceOperationPhaseLabel(operation.phase)}</div>
                 <WorkspaceOperationStatusBadge status={operation.status} />
-                <div className="text-[11px] text-muted-foreground">
+                <div className="text-(length:--text-micro) text-muted-foreground">
                   {relativeTime(operation.startedAt)}
                   {operation.finishedAt && ` to ${relativeTime(operation.finishedAt)}`}
                 </div>
@@ -675,14 +685,11 @@ export function AgentDetail() {
   }>();
   const { companies, selectedCompanyId, setSelectedCompanyId } = useCompany();
   const { closePanel } = usePanel();
-  const { openNewIssue } = useDialogActions();
-  const { pushToast } = useToastActions();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [actionError, setActionError] = useState<string | null>(null);
   const [dismissedLeftAgentIds, setDismissedLeftAgentIds] = useState<Set<string>>(() => new Set());
-  const [moreOpen, setMoreOpen] = useState(false);
   const activeView = urlRunId ? "runs" as AgentDetailView : parseAgentDetailView(urlTab ?? null);
   const needsDashboardData = activeView === "dashboard";
   const needsRunData = activeView === "runs" || Boolean(urlRunId);
@@ -717,6 +724,80 @@ export function AgentDetail() {
   const agentMembershipState = resolvedAgentId
     ? resourceMembershipState(membershipsQuery.data, "agent", resolvedAgentId)
     : "joined";
+
+  const { data: experimentalSettings } = useQuery({
+    queryKey: queryKeys.instance.experimentalSettings,
+    queryFn: () => instanceSettingsApi.getExperimental(),
+    enabled: !!resolvedCompanyId,
+  });
+  const builtInAgentsEnabled = experimentalSettings?.enableBuiltInAgents === true;
+  const { data: builtInStates } = useQuery({
+    queryKey: queryKeys.builtInAgents.list(resolvedCompanyId!),
+    queryFn: () => builtInAgentsApi.list(resolvedCompanyId!),
+    enabled: !!resolvedCompanyId && builtInAgentsEnabled,
+  });
+  const builtInState = builtInAgentsEnabled
+    ? builtInStates?.find((entry) => entry.agentId === resolvedAgentId) ?? null
+    : null;
+  const builtInFeatureLabel = builtInState
+    ? builtInState.definition.featureKeys
+        .map((key) => key.charAt(0).toUpperCase() + key.slice(1))
+        .join(", ")
+    : "";
+  const invalidateBuiltIn = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.builtInAgents.list(resolvedCompanyId!) });
+    if (resolvedAgentId) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(resolvedAgentId) });
+    }
+    queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
+  }, [queryClient, resolvedCompanyId, resolvedAgentId, routeAgentRef]);
+
+  const resetBuiltIn = useMutation({
+    mutationFn: () => builtInAgentsApi.reset(resolvedCompanyId!, builtInState!.definition.key),
+    onSuccess: invalidateBuiltIn,
+  });
+
+  const [showBuiltInConfigure, setShowBuiltInConfigure] = useState(false);
+  const resetBuiltInResource = useMutation({
+    mutationFn: (kind: BuiltInManagedResourceKind) =>
+      builtInAgentsApi.reset(resolvedCompanyId!, builtInState!.definition.key, [kind]),
+    onSuccess: invalidateBuiltIn,
+    onError: (error) => {
+      setActionError(error instanceof Error ? error.message : "Failed to update bundle resource");
+    },
+  });
+  const runBuiltInRoutine = useMutation({
+    mutationFn: (routineKey: string) =>
+      builtInAgentsApi.runRoutine(resolvedCompanyId!, builtInState!.definition.key, routineKey),
+    onSuccess: invalidateBuiltIn,
+    onError: (error) => {
+      setActionError(error instanceof Error ? error.message : "Failed to run built-in routine");
+    },
+  });
+  const enableBuiltInSchedule = useMutation({
+    mutationFn: (routineKey: string) =>
+      builtInAgentsApi.enableRoutineSchedule(resolvedCompanyId!, builtInState!.definition.key, routineKey),
+    onSuccess: invalidateBuiltIn,
+    onError: (error) => {
+      setActionError(error instanceof Error ? error.message : "Failed to enable routine schedule");
+    },
+  });
+  const disableBuiltInSchedule = useMutation({
+    mutationFn: (routineKey: string) =>
+      builtInAgentsApi.disableRoutineSchedule(resolvedCompanyId!, builtInState!.definition.key, routineKey),
+    onSuccess: invalidateBuiltIn,
+    onError: (error) => {
+      setActionError(error instanceof Error ? error.message : "Failed to disable routine schedule");
+    },
+  });
+  const builtInRoutineActionPending =
+    runBuiltInRoutine.isPending
+      ? "run"
+      : enableBuiltInSchedule.isPending
+        ? "enable"
+        : disableBuiltInSchedule.isPending
+          ? "disable"
+          : null;
 
   const { data: runtimeState } = useQuery({
     queryKey: queryKeys.agents.runtimeState(resolvedAgentId ?? routeAgentRef),
@@ -821,18 +902,17 @@ export function AgentDetail() {
     setSelectedCompanyId(agent.companyId, { source: "route_sync" });
   }, [agent?.companyId, selectedCompanyId, setSelectedCompanyId]);
 
+  // Invoke / pause / resume / terminate / duplicate / reset live in the shared
+  // AgentActionButtons component. The detail header keeps only "approve" here,
+  // which is surfaced via the pending-approval banner below.
   const agentAction = useMutation({
-    mutationFn: async (action: "invoke" | "pause" | "resume" | "approve" | "terminate") => {
+    mutationFn: async (action: "approve") => {
       if (!agentLookupRef) return Promise.reject(new Error("No agent reference"));
-      switch (action) {
-        case "invoke": return agentsApi.invoke(agentLookupRef, resolvedCompanyId ?? undefined);
-        case "pause": return agentsApi.pause(agentLookupRef, resolvedCompanyId ?? undefined);
-        case "resume": return agentsApi.resume(agentLookupRef, resolvedCompanyId ?? undefined);
-        case "approve": return agentsApi.approve(agentLookupRef, resolvedCompanyId ?? undefined);
-        case "terminate": return agentsApi.terminate(agentLookupRef, resolvedCompanyId ?? undefined);
+      if (action === "approve") {
+        return agentsApi.approve(agentLookupRef, resolvedCompanyId ?? undefined);
       }
     },
-    onSuccess: (data, action) => {
+    onSuccess: () => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentLookupRef) });
@@ -844,65 +924,11 @@ export function AgentDetail() {
           queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(resolvedCompanyId, agent.id) });
         }
       }
-      if (action === "invoke" && data && typeof data === "object" && "id" in data) {
-        navigate(`/agents/${canonicalAgentRef}/runs/${(data as HeartbeatRun).id}`);
-      }
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : "Action failed");
     },
   });
-
-  const duplicateAgent = useMutation({
-    mutationFn: async () => {
-      if (!agent?.id || !resolvedCompanyId) {
-        throw new Error("Agent is not ready to duplicate");
-      }
-
-      const instructionsBundle = await loadDuplicateInstructionsBundle(agent.id, resolvedCompanyId);
-      const payload = buildDuplicateAgentPayload(agent, instructionsBundle);
-
-      try {
-        return await agentsApi.create(resolvedCompanyId, payload);
-      } catch (error) {
-        if (error instanceof ApiError && error.status === 409 && error.message.includes("requires board approval")) {
-          const hire = await agentsApi.hire(resolvedCompanyId, payload);
-          return hire.agent;
-        }
-        throw error;
-      }
-    },
-    onSuccess: async (createdAgent) => {
-      setActionError(null);
-      if (resolvedCompanyId) {
-        await queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(resolvedCompanyId) });
-      }
-      pushToast({
-        title: "Agent duplicated",
-        body: createdAgent.name,
-        tone: "success",
-      });
-      navigate(`/agents/${agentRouteRef(createdAgent)}/dashboard`);
-    },
-    onError: (err) => {
-      const message = err instanceof Error ? err.message : "Failed to duplicate agent";
-      setActionError(message);
-      pushToast({
-        title: "Could not duplicate agent",
-        body: message,
-        tone: "error",
-      });
-    },
-  });
-
-  const handleDuplicateAgent = useCallback(() => {
-    if (!agent || duplicateAgent.isPending) return;
-    const nextName = duplicateAgentName(agent.name);
-    const confirmed = window.confirm(`Duplicate ${agent.name} as ${nextName}?`);
-    setMoreOpen(false);
-    if (!confirmed) return;
-    duplicateAgent.mutate();
-  }, [agent, duplicateAgent]);
 
   const budgetMutation = useMutation({
     mutationFn: (amount: number) =>
@@ -930,19 +956,6 @@ export function AgentDetail() {
       if (resolvedCompanyId) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(resolvedCompanyId) });
       }
-    },
-  });
-
-  const resetTaskSession = useMutation({
-    mutationFn: (taskKey: string | null) =>
-      agentsApi.resetSession(agentLookupRef, taskKey, resolvedCompanyId ?? undefined),
-    onSuccess: () => {
-      setActionError(null);
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.runtimeState(agentLookupRef) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.taskSessions(agentLookupRef) });
-    },
-    onError: (err) => {
-      setActionError(err instanceof Error ? err.message : "Failed to reset session");
     },
   });
 
@@ -1021,25 +1034,29 @@ export function AgentDetail() {
     return <Navigate to={`/agents/${canonicalAgentRef}/dashboard`} replace />;
   }
   const isPendingApproval = agent.status === "pending_approval";
+  const hasInvalidOrgChain = agent.orgChainHealth?.status === "invalid_org_chain";
   const showConfigActionBar = (activeView === "configuration" || activeView === "instructions") && (configDirty || configSaving);
   const showLeftAgentNotice = agentMembershipState === "left" && !dismissedLeftAgentIds.has(agent.id);
   const agentMembershipPending =
     membershipMutation.isPending &&
     membershipMutation.variables?.resourceType === "agent" &&
     membershipMutation.variables.resourceId === agent.id;
+  const agentStarred = isStarred(membershipsQuery.data, "agent", agent.id);
+  const agentStarPending = agentMembershipPending && membershipMutation.variables?.starred !== undefined;
+  const agentJoinLeavePending = agentMembershipPending && membershipMutation.variables?.starred === undefined;
 
   return (
     <div className={cn("space-y-6", isMobile && showConfigActionBar && "pb-24")}>
       {showLeftAgentNotice ? (
-        <div className="flex items-center gap-3 border border-yellow-300/35 bg-yellow-300/10 px-3 py-2 text-sm text-yellow-100">
+        <div className="flex items-center gap-3 border border-yellow-300/35 bg-yellow-300/10 px-3 py-2 text-sm text-yellow-900 dark:text-yellow-100">
           <p className="min-w-0 flex-1">
             You left this agent. It no longer appears in your sidebar.
           </p>
           <MembershipAction
             compact
             state="left"
-            pending={agentMembershipPending}
-            pendingState={agentMembershipPending ? membershipMutation.variables?.state : null}
+            pending={agentJoinLeavePending}
+            pendingState={agentJoinLeavePending ? membershipMutation.variables?.state : null}
             resourceName={agent.name}
             onJoin={() => membershipMutation.mutate({
               resourceType: "agent",
@@ -1056,12 +1073,33 @@ export function AgentDetail() {
           />
           <button
             type="button"
-            className="h-6 w-6 shrink-0 text-yellow-100/70 hover:text-yellow-100"
+            className="h-6 w-6 shrink-0 text-yellow-900/70 hover:text-yellow-900 dark:text-yellow-100/70 dark:hover:text-yellow-100"
             aria-label="Dismiss agent membership notice"
             onClick={() => setDismissedLeftAgentIds((current) => new Set(current).add(agent.id))}
           >
             ×
           </button>
+        </div>
+      ) : null}
+      {hasInvalidOrgChain ? (
+        <div className="flex items-start gap-3 border border-amber-300/35 bg-amber-300/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="min-w-0 space-y-1">
+            <p className="font-medium">Invalid reporting chain</p>
+            <p className="text-amber-900/90 dark:text-amber-100/90">
+              {agent.name} cannot accept tasks or start runs until its reporting chain is repaired.
+            </p>
+            <p className="break-words font-mono text-xs text-amber-900/80 dark:text-amber-100/80">
+              {formatOrgChainHealthPath(agent)}
+            </p>
+            {agent.orgChainHealth?.repairGuidance ? (
+              <p className="text-amber-900/85 dark:text-amber-100/85">{agent.orgChainHealth.repairGuidance}</p>
+            ) : (
+              <p className="text-amber-900/85 dark:text-amber-100/85">
+                Assign this agent to an active manager/root, or explicitly pause or terminate the affected agent/subtree.
+              </p>
+            )}
+          </div>
         </div>
       ) : null}
       {/* Header */}
@@ -1076,101 +1114,117 @@ export function AgentDetail() {
             </button>
           </AgentIconPicker>
           <div className="min-w-0">
-            <h2 className="text-2xl font-bold truncate">{agent.name}</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-2xl font-bold truncate">{agent.name}</h2>
+              {builtInState && <BuiltInAgentBadge />}
+            </div>
             <p className="text-sm text-muted-foreground truncate">
               {roleLabels[agent.role] ?? agent.role}
               {agent.title ? ` - ${agent.title}` : ""}
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => openNewIssue({ assigneeAgentId: agent.id })}
+        <div className="flex items-center gap-2 shrink-0">
+          <StarToggle
+            size="button"
+            starred={agentStarred}
+            pending={agentStarPending}
+            resourceName={agent.name}
+            onToggle={(next) => membershipMutation.mutate({
+              resourceType: "agent",
+              resourceId: agent.id,
+              resourceName: agent.name,
+              starred: next,
+            })}
+          />
+          <AgentActionButtons
+            agent={agent}
+            companyId={resolvedCompanyId}
+            assignLabel="Assign Task"
+            runLabel="Run Heartbeat"
+            actionsDisabled={agentAction.isPending}
+            workActionsDisabled={hasInvalidOrgChain}
+            workActionsDisabledReason="Repair this agent's reporting chain before assigning tasks or starting runs"
+            onActionError={setActionError}
+            hideTerminate={Boolean(builtInState)}
+            pauseConfirm={
+              builtInState
+                ? {
+                    title: `Pause the ${builtInState.definition.displayName}?`,
+                    description: (
+                      <>
+                        {builtInFeatureLabel} depends on this agent. While paused,{" "}
+                        {builtInFeatureLabel.toLowerCase()} generation is skipped and the{" "}
+                        {builtInFeatureLabel} page shows a warning.
+                      </>
+                    ),
+                  }
+                : undefined
+            }
           >
-            <Plus className="h-3.5 w-3.5 sm:mr-1" />
-            <span className="hidden sm:inline">Assign Task</span>
-          </Button>
-          <RunButton
-            onClick={() => agentAction.mutate("invoke")}
-            disabled={agentAction.isPending || isPendingApproval}
-            label="Run Heartbeat"
-          />
-          <PauseResumeButton
-            isPaused={agent.status === "paused"}
-            onPause={() => agentAction.mutate("pause")}
-            onResume={() => agentAction.mutate("resume")}
-            disabled={agentAction.isPending || isPendingApproval}
-          />
-          <span className="hidden sm:inline"><StatusBadge status={agent.status} /></span>
-          {mobileLiveRun && (
-            <Link
-              to={`/agents/${canonicalAgentRef}/runs/${mobileLiveRun.id}`}
-              className="sm:hidden flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-500/10 hover:bg-blue-500/20 transition-colors no-underline"
-            >
-              <span className="relative flex h-2 w-2">
-                <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
-              </span>
-              <span className="text-[11px] font-medium text-blue-600 dark:text-blue-400">Live</span>
-            </Link>
-          )}
-
-          {/* Overflow menu */}
-          <Popover open={moreOpen} onOpenChange={setMoreOpen}>
-            <PopoverTrigger asChild>
-              <Button variant="ghost" size="icon-xs">
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-44 p-1" align="end">
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
-                disabled={duplicateAgent.isPending}
-                onClick={handleDuplicateAgent}
+            {mobileLiveRun && (
+              <Link
+                to={`/agents/${canonicalAgentRef}/runs/${mobileLiveRun.id}`}
+                className="sm:hidden flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-500/10 hover:bg-blue-500/20 transition-colors no-underline"
               >
-                {duplicateAgent.isPending ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Copy className="h-3 w-3" />
-                )}
-                Duplicate Agent
-              </button>
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
-                onClick={() => {
-                  navigator.clipboard.writeText(agent.id);
-                  setMoreOpen(false);
-                }}
-              >
-                <Copy className="h-3 w-3" />
-                Copy Agent ID
-              </button>
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
-                onClick={() => {
-                  resetTaskSession.mutate(null);
-                  setMoreOpen(false);
-                }}
-              >
-                <RotateCcw className="h-3 w-3" />
-                Reset Sessions
-              </button>
-              <button
-                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
-                onClick={() => {
-                  agentAction.mutate("terminate");
-                  setMoreOpen(false);
-                }}
-              >
-                <Trash2 className="h-3 w-3" />
-                Terminate
-              </button>
-            </PopoverContent>
-          </Popover>
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+                </span>
+                <span className="text-(length:--text-micro) font-medium text-blue-600 dark:text-blue-400">Live</span>
+              </Link>
+            )}
+          </AgentActionButtons>
         </div>
       </div>
+
+      {builtInState && (
+        <InlineBanner
+          tone="info"
+          title="Built-in agent"
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => resetBuiltIn.mutate()}
+              disabled={resetBuiltIn.isPending}
+            >
+              {resetBuiltIn.isPending ? "Resetting…" : "Reset to defaults"}
+            </Button>
+          }
+        >
+          Ships with Paperclip and powers <strong>{builtInFeatureLabel}</strong>. Configure it like
+          any agent — model, instructions, budget. It can be paused but not deleted; pausing it
+          pauses {builtInFeatureLabel}.
+        </InlineBanner>
+      )}
+
+      {builtInState?.definition.bundle && (
+        <BuiltInBundlePanel
+          state={builtInState}
+          agentRef={canonicalAgentRef}
+          onConfigure={() => setShowBuiltInConfigure(true)}
+          onResetResource={(kind) => resetBuiltInResource.mutate(kind)}
+          onRunRoutine={(routineKey) => runBuiltInRoutine.mutate(routineKey)}
+          onEnableSchedule={(routineKey) => enableBuiltInSchedule.mutate(routineKey)}
+          onDisableSchedule={(routineKey) => disableBuiltInSchedule.mutate(routineKey)}
+          resettingResource={resetBuiltInResource.isPending ? resetBuiltInResource.variables ?? null : null}
+          routineActionPending={builtInRoutineActionPending}
+        />
+      )}
+
+      {builtInState && resolvedCompanyId && (
+        <ConfigureBuiltInAgentModal
+          companyId={resolvedCompanyId}
+          state={builtInState}
+          open={showBuiltInConfigure}
+          onOpenChange={setShowBuiltInConfigure}
+          onConfigured={() => {
+            setShowBuiltInConfigure(false);
+            invalidateBuiltIn();
+          }}
+        />
+      )}
 
       {!urlRunId && (
         <Tabs
@@ -1377,8 +1431,8 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
         <h3 className="flex items-center gap-2 text-sm font-medium">
           {isLive && (
             <span className="relative flex h-2 w-2">
-              <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-400" />
+              <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
             </span>
           )}
           {isLive ? "Live Run" : "Latest Run"}
@@ -1395,22 +1449,22 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
         to={`/agents/${agentId}/runs/${run.id}`}
         className={cn(
           "block border rounded-lg p-4 space-y-2 w-full no-underline transition-colors hover:bg-muted/50 cursor-pointer",
-          isLive ? "border-cyan-500/30 shadow-[0_0_12px_rgba(6,182,212,0.08)]" : "border-border"
+          isLive ? "border-blue-500/30 shadow-(--shadow-extract-14)" : "border-border"
         )}
       >
         <div className="flex items-center gap-2">
           <StatusIcon className={cn("h-3.5 w-3.5", statusInfo.color, run.status === "running" && "animate-spin")} />
           <StatusBadge status={run.status} />
           <span className="font-mono text-xs text-muted-foreground">{run.id.slice(0, 8)}</span>
-          <span className={cn(
-            "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium",
+          <Badge variant="ghost" className={cn(
+            "px-1.5 text-(length:--text-nano)",
             run.invocationSource === "timer" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300"
               : run.invocationSource === "assignment" ? "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
               : run.invocationSource === "on_demand" ? "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/50 dark:text-cyan-300"
               : "bg-muted text-muted-foreground"
           )}>
             {sourceLabels[run.invocationSource] ?? run.invocationSource}
-          </span>
+          </Badge>
           <span className="ml-auto text-xs text-muted-foreground">{relativeTime(run.createdAt)}</span>
         </div>
 
@@ -1451,10 +1505,10 @@ function AgentOverview({
         <ChartCard title="Run Activity" subtitle="Last 14 days">
           <RunActivityChart runs={runs} />
         </ChartCard>
-        <ChartCard title="Issues by Priority" subtitle="Last 14 days">
+        <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
           <PriorityChart issues={assignedIssues} />
         </ChartCard>
-        <ChartCard title="Issues by Status" subtitle="Last 14 days">
+        <ChartCard title="Tasks by Status" subtitle="Last 14 days">
           <IssueStatusChart issues={assignedIssues} />
         </ChartCard>
         <ChartCard title="Success Rate" subtitle="Last 14 days">
@@ -1465,7 +1519,7 @@ function AgentOverview({
       {/* Recent Issues */}
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-medium">Recent Issues</h3>
+          <h3 className="text-sm font-medium">Recent Tasks</h3>
           <Link
             to={`/issues?participantAgentId=${agentId}`}
             className="text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -1474,7 +1528,7 @@ function AgentOverview({
           </Link>
         </div>
         {assignedIssues.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No recent issues.</p>
+          <p className="text-sm text-muted-foreground">No recent tasks.</p>
         ) : (
           <div className="border border-border rounded-lg">
             {assignedIssues.slice(0, 10).map((issue) => (
@@ -1488,7 +1542,7 @@ function AgentOverview({
             ))}
             {assignedIssues.length > 10 && (
               <div className="px-3 py-2 text-xs text-muted-foreground text-center border-t border-border">
-                +{assignedIssues.length - 10} more issues
+                +{assignedIssues.length - 10} more tasks
               </div>
             )}
           </div>
@@ -1729,6 +1783,22 @@ function ConfigurationTab({
     enabled: Boolean(companyId),
   });
 
+  const lowTrustSelected = getTrustPreset(agent.permissions) === "low_trust_review";
+
+  const { data: boundaryProjects, isLoading: boundaryProjectsLoading } = useQuery({
+    queryKey: companyId ? queryKeys.projects.list(companyId) : ["projects", "__low-trust-disabled"],
+    queryFn: () => projectsApi.list(companyId!),
+    enabled: Boolean(companyId && lowTrustSelected),
+  });
+
+  const { data: boundaryIssues, isLoading: boundaryIssuesLoading } = useQuery({
+    queryKey: companyId
+      ? [...queryKeys.issues.list(companyId), "low-trust-boundary-candidates"]
+      : ["issues", "__low-trust-disabled"],
+    queryFn: () => issuesApi.list(companyId!, { limit: 100, sortField: "updated", sortDir: "desc" }),
+    enabled: Boolean(companyId && lowTrustSelected),
+  });
+
   const updateAgent = useMutation({
     mutationFn: (data: Record<string, unknown>) => agentsApi.update(agent.id, data, companyId),
     onMutate: () => {
@@ -1739,6 +1809,7 @@ function ConfigurationTab({
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(agent.companyId) });
+      pushToast({ title: "Agent saved", tone: "success" });
     },
     onError: (err) => {
       setAwaitingRefreshAfterSave(false);
@@ -1765,6 +1836,7 @@ function ConfigurationTab({
   }, [onSavingChange, isConfigSaving]);
 
   const canCreateAgents = Boolean(agent.permissions?.canCreateAgents);
+  const canCreateSkills = agent.permissions?.canCreateSkills !== false;
   const canAssignTasks = Boolean(agent.access?.canAssignTasks);
   const taskAssignSource = agent.access?.taskAssignSource ?? "none";
   const taskAssignLocked = agent.role === "ceo" || canCreateAgents;
@@ -1784,7 +1856,7 @@ function ConfigurationTab({
       <AgentConfigForm
         mode="edit"
         agent={agent}
-        onSave={(patch) => updateAgent.mutate(patch)}
+        onSave={(patch) => updateAgent.mutateAsync(patch)}
         isSaving={isConfigSaving}
         adapterModels={adapterModels}
         onDirtyChange={onDirtyChange}
@@ -1795,6 +1867,32 @@ function ConfigurationTab({
         hideInstructionsFile={hideInstructionsFile}
         sectionLayout="cards"
       />
+      <p className="text-xs text-muted-foreground">
+        Saved adapter config affects the next run. Active runs keep the config they started with, and config changes may start a fresh adapter session.
+      </p>
+
+      <TrustPresetSection
+        permissions={agent.permissions}
+        disabled={updatePermissions.isPending}
+        companyId={companyId}
+        projectCandidates={(boundaryProjects ?? []).map((project) => ({
+          id: project.id,
+          label: project.name,
+        }))}
+        issueCandidates={(boundaryIssues ?? []).map((issue) => ({
+          id: issue.id,
+          label: `${issue.identifier ?? issue.id.slice(0, 8)} · ${issue.title}`,
+        }))}
+        candidatesLoading={boundaryProjectsLoading || boundaryIssuesLoading}
+        onChange={(nextPermissions) =>
+          updatePermissions.mutate({
+            canCreateAgents,
+            canCreateSkills,
+            canAssignTasks,
+            ...buildPermissionsForTrustPreset(nextPermissions, nextPermissions.trustPreset === "low_trust_review" ? "low_trust_review" : "standard"),
+          })
+        }
+      />
 
       <div>
         <h3 className="text-sm font-medium mb-3">Permissions</h3>
@@ -1803,7 +1901,7 @@ function ConfigurationTab({
             <div className="space-y-1">
               <div>Can create new agents</div>
               <p className="text-xs text-muted-foreground">
-                Lets this agent create or hire agents and implicitly assign tasks.
+                Lets this agent create or hire agents. This also grants task assignment authority.
               </p>
             </div>
             <ToggleSwitch
@@ -1811,7 +1909,27 @@ function ConfigurationTab({
               onCheckedChange={() =>
                 updatePermissions.mutate({
                   canCreateAgents: !canCreateAgents,
+                  canCreateSkills,
                   canAssignTasks: !canCreateAgents ? true : canAssignTasks,
+                })
+              }
+              disabled={updatePermissions.isPending}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 text-sm">
+            <div className="space-y-1">
+              <div>Can create/import skills</div>
+              <p className="text-xs text-muted-foreground">
+                Lets this agent install, import, create, and scan company skills without creating agents.
+              </p>
+            </div>
+            <ToggleSwitch
+              checked={canCreateSkills}
+              onCheckedChange={() =>
+                updatePermissions.mutate({
+                  canCreateAgents,
+                  canCreateSkills: !canCreateSkills,
+                  canAssignTasks,
                 })
               }
               disabled={updatePermissions.isPending}
@@ -1829,6 +1947,7 @@ function ConfigurationTab({
               onCheckedChange={() =>
                 updatePermissions.mutate({
                   canCreateAgents,
+                  canCreateSkills,
                   canAssignTasks: !canAssignTasks,
                 })
               }
@@ -1843,7 +1962,7 @@ function ConfigurationTab({
 
 /* ---- Prompts Tab ---- */
 
-function PromptsTab({
+export function PromptsTab({
   agent,
   companyId,
   onDirtyChange,
@@ -2082,6 +2201,12 @@ function PromptsTab({
 
   const currentContent = selectedFileExists ? (selectedFileDetail?.content ?? "") : "";
   const displayValue = draft ?? currentContent;
+  const useMarkdownEditor = shouldUseMarkdownInstructionsEditor({
+    selectedFileExists,
+    selectedPath: selectedOrEntryFile,
+    detail: selectedFileDetail,
+    summary: selectedFileSummary,
+  });
   const bundleDirty = Boolean(
     bundleDraft &&
       (
@@ -2188,12 +2313,15 @@ function PromptsTab({
       {(bundle?.warnings ?? []).length > 0 && (
         <div className="space-y-2">
           {(bundle?.warnings ?? []).map((warning) => (
-            <div key={warning} className="rounded-md border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-xs text-sky-100">
+            <div key={warning} className="rounded-md border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-xs text-sky-900 dark:text-sky-100">
               {warning}
             </div>
           ))}
         </div>
       )}
+      <p className="text-xs text-muted-foreground">
+        Saved instructions affect the next run. Active runs keep the instructions they started with, and instruction changes may start a fresh adapter session.
+      </p>
 
       <Collapsible defaultOpen={currentMode === "external"}>
         <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors group">
@@ -2202,7 +2330,7 @@ function PromptsTab({
         </CollapsibleTrigger>
         <CollapsibleContent className="pt-4 pb-6">
           <TooltipProvider>
-            <div className="grid gap-x-6 gap-y-4 md:grid-cols-[auto_minmax(0,1fr)_minmax(12rem,0.65fr)]">
+            <div className="grid gap-x-6 gap-y-4 md:grid-cols-(--gtc-18)">
               <label className="space-y-1.5 min-w-0">
                 <span className="text-xs font-medium text-muted-foreground flex items-center gap-1">
                   Mode
@@ -2464,7 +2592,7 @@ function PromptsTab({
                 return (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <span className="ml-3 shrink-0 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide cursor-help">
+                      <span className="ml-3 shrink-0 rounded border border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200 px-1.5 py-0.5 text-(length:--text-nano) uppercase tracking-wide cursor-help">
                         virtual file
                       </span>
                     </TooltipTrigger>
@@ -2475,7 +2603,7 @@ function PromptsTab({
                 );
               }
               return (
-                <span className="ml-3 shrink-0 rounded border border-border text-muted-foreground px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
+                <span className="ml-3 shrink-0 rounded border border-border text-muted-foreground px-1.5 py-0.5 text-(length:--text-nano) uppercase tracking-wide">
                   {file.isEntryFile ? "entry" : `${file.size}b`}
                 </span>
               );
@@ -2553,14 +2681,14 @@ function PromptsTab({
 
           {selectedFileExists && fileLoading && !selectedFileDetail ? (
             <PromptEditorSkeleton />
-          ) : isMarkdown(selectedOrEntryFile) ? (
+          ) : useMarkdownEditor ? (
             <MarkdownEditor
               key={selectedOrEntryFile}
               value={displayValue}
               onChange={(value) => setDraft(value ?? "")}
               placeholder="# Agent instructions"
               className="min-w-0 overflow-hidden"
-              contentClassName="min-h-[420px] max-w-full break-words text-sm font-mono"
+              contentClassName="min-h-(--sz-420px) max-w-full break-words text-sm leading-7"
               imageUploadHandler={async (file) => {
                 const namespace = `agents/${agent.id}/instructions/${selectedOrEntryFile.replaceAll("/", "-")}`;
                 const asset = await uploadMarkdownImage.mutateAsync({ file, namespace });
@@ -2571,7 +2699,7 @@ function PromptsTab({
             <textarea
               value={displayValue}
               onChange={(event) => setDraft(event.target.value)}
-              className="min-h-[420px] w-full min-w-0 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm outline-none"
+              className="min-h-(--sz-420px) w-full min-w-0 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm outline-none"
               placeholder="File contents"
             />
           )}
@@ -2589,7 +2717,7 @@ function PromptsTabSkeleton() {
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-2">
             <Skeleton className="h-4 w-40" />
-            <Skeleton className="h-4 w-[30rem] max-w-full" />
+            <Skeleton className="h-4 w-(--sz-30rem) max-w-full" />
           </div>
           <Skeleton className="h-4 w-16" />
         </div>
@@ -2602,7 +2730,7 @@ function PromptsTabSkeleton() {
           ))}
         </div>
       </div>
-      <div className="grid gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
+      <div className="grid gap-4 lg:grid-cols-(--gtc-19)">
         <div className="rounded-lg border border-border p-3 space-y-3">
           <div className="flex items-center justify-between">
             <Skeleton className="h-4 w-12" />
@@ -2631,450 +2759,7 @@ function PromptEditorSkeleton() {
   return (
     <div className="space-y-3">
       <Skeleton className="h-10 w-full" />
-      <Skeleton className="h-[420px] w-full" />
-    </div>
-  );
-}
-
-export function AgentSkillsTab({
-  agent,
-  companyId,
-}: {
-  agent: Agent;
-  companyId?: string;
-}) {
-  type SkillRow = {
-    id: string;
-    key: string;
-    name: string;
-    description: string | null;
-    detail: string | null;
-    locationLabel: string | null;
-    originLabel: string | null;
-    linkTo: string | null;
-    readOnly: boolean;
-    adapterEntry: AgentSkillEntry | null;
-  };
-
-  const queryClient = useQueryClient();
-  const [skillDraft, setSkillDraft] = useState<string[]>([]);
-  const [lastSavedSkills, setLastSavedSkills] = useState<string[]>([]);
-  const [unmanagedOpen, setUnmanagedOpen] = useState(false);
-  const lastSavedSkillsRef = useRef<string[]>([]);
-  const hasHydratedSkillSnapshotRef = useRef(false);
-  const skipNextSkillAutosaveRef = useRef(true);
-
-  const { data: skillSnapshot, isLoading } = useQuery({
-    queryKey: queryKeys.agents.skills(agent.id),
-    queryFn: () => agentsApi.skills(agent.id, companyId),
-    enabled: Boolean(companyId),
-  });
-
-  const { data: companySkills } = useQuery({
-    queryKey: queryKeys.companySkills.list(companyId ?? ""),
-    queryFn: () => companySkillsApi.list(companyId!),
-    enabled: Boolean(companyId),
-  });
-
-  const syncSkills = useMutation({
-    mutationFn: (desiredSkills: string[]) => agentsApi.syncSkills(agent.id, desiredSkills, companyId),
-    onSuccess: async (snapshot) => {
-      queryClient.setQueryData(queryKeys.agents.skills(agent.id), snapshot);
-      lastSavedSkillsRef.current = snapshot.desiredSkills;
-      setLastSavedSkills(snapshot.desiredSkills);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) }),
-      ]);
-    },
-  });
-
-  useEffect(() => {
-    setSkillDraft([]);
-    setLastSavedSkills([]);
-    lastSavedSkillsRef.current = [];
-    hasHydratedSkillSnapshotRef.current = false;
-    skipNextSkillAutosaveRef.current = true;
-  }, [agent.id]);
-
-  useEffect(() => {
-    if (!skillSnapshot) return;
-    const nextState = applyAgentSkillSnapshot(
-      {
-        draft: skillDraft,
-        lastSaved: lastSavedSkillsRef.current,
-        hasHydratedSnapshot: hasHydratedSkillSnapshotRef.current,
-      },
-      skillSnapshot.desiredSkills,
-    );
-    skipNextSkillAutosaveRef.current = nextState.shouldSkipAutosave;
-    hasHydratedSkillSnapshotRef.current = nextState.hasHydratedSnapshot;
-    setSkillDraft(nextState.draft);
-    lastSavedSkillsRef.current = nextState.lastSaved;
-    setLastSavedSkills(nextState.lastSaved);
-  }, [skillDraft, skillSnapshot]);
-
-  useEffect(() => {
-    if (!skillSnapshot) return;
-    if (skipNextSkillAutosaveRef.current) {
-      skipNextSkillAutosaveRef.current = false;
-      return;
-    }
-    if (syncSkills.isPending) return;
-    if (arraysEqual(skillDraft, lastSavedSkillsRef.current)) return;
-
-    const timeout = window.setTimeout(() => {
-      if (!arraysEqual(skillDraft, lastSavedSkillsRef.current)) {
-        syncSkills.mutate(skillDraft);
-      }
-    }, 250);
-
-    return () => window.clearTimeout(timeout);
-  }, [skillDraft, skillSnapshot, syncSkills.isPending, syncSkills.mutate]);
-
-  const companySkillByKey = useMemo(
-    () => new Map((companySkills ?? []).map((skill) => [skill.key, skill])),
-    [companySkills],
-  );
-  const companySkillKeys = useMemo(
-    () => new Set((companySkills ?? []).map((skill) => skill.key)),
-    [companySkills],
-  );
-  const adapterEntryByKey = useMemo(
-    () => new Map((skillSnapshot?.entries ?? []).map((entry) => [entry.key, entry])),
-    [skillSnapshot],
-  );
-  const optionalSkillRows = useMemo<SkillRow[]>(
-    () =>
-      (companySkills ?? [])
-        .filter((skill) => !adapterEntryByKey.get(skill.key)?.required)
-        .map((skill) => ({
-          id: skill.id,
-          key: skill.key,
-          name: skill.name,
-          description: skill.description,
-          detail: adapterEntryByKey.get(skill.key)?.detail ?? null,
-          locationLabel: adapterEntryByKey.get(skill.key)?.locationLabel ?? null,
-          originLabel: adapterEntryByKey.get(skill.key)?.originLabel ?? null,
-          linkTo: `/skills/${skill.id}`,
-          readOnly: false,
-          adapterEntry: adapterEntryByKey.get(skill.key) ?? null,
-        })),
-    [adapterEntryByKey, companySkills],
-  );
-  const requiredSkillRows = useMemo<SkillRow[]>(
-    () =>
-      (skillSnapshot?.entries ?? [])
-        .filter((entry) => entry.required)
-        .map((entry) => {
-          const companySkill = companySkillByKey.get(entry.key);
-          return {
-            id: companySkill?.id ?? `required:${entry.key}`,
-            key: entry.key,
-            name: companySkill?.name ?? entry.key,
-            description: companySkill?.description ?? null,
-            detail: entry.detail ?? null,
-            locationLabel: entry.locationLabel ?? null,
-            originLabel: entry.originLabel ?? null,
-            linkTo: companySkill ? `/skills/${companySkill.id}` : null,
-            readOnly: false,
-            adapterEntry: entry,
-          };
-        }),
-    [companySkillByKey, skillSnapshot],
-  );
-  const unmanagedSkillRows = useMemo<SkillRow[]>(
-    () =>
-      (skillSnapshot?.entries ?? [])
-        .filter((entry) => isReadOnlyUnmanagedSkillEntry(entry, companySkillKeys))
-        .map((entry) => ({
-          id: `external:${entry.key}`,
-          key: entry.key,
-          name: entry.runtimeName ?? entry.key,
-          description: null,
-          detail: entry.detail ?? null,
-          locationLabel: entry.locationLabel ?? null,
-          originLabel: entry.originLabel ?? null,
-          linkTo: null,
-          readOnly: true,
-          adapterEntry: entry,
-        })),
-    [companySkillKeys, skillSnapshot],
-  );
-  const installedSkillRows = useMemo(
-    () => optionalSkillRows.filter((skill) => skillDraft.includes(skill.key)),
-    [optionalSkillRows, skillDraft],
-  );
-  const otherSkillRows = useMemo(
-    () => optionalSkillRows.filter((skill) => !skillDraft.includes(skill.key)),
-    [optionalSkillRows, skillDraft],
-  );
-  const desiredOnlyMissingSkills = useMemo(
-    () => skillDraft.filter((key) => !companySkillByKey.has(key)),
-    [companySkillByKey, skillDraft],
-  );
-  const skillApplicationLabel = useMemo(() => {
-    switch (skillSnapshot?.mode) {
-      case "persistent":
-        return "Kept in the workspace";
-      case "ephemeral":
-        return "Applied when the agent runs";
-      case "unsupported":
-        return "Tracked only";
-      default:
-        return "Unknown";
-    }
-  }, [skillSnapshot?.mode]);
-  const unsupportedSkillMessage = useMemo(() => {
-    if (skillSnapshot?.mode !== "unsupported") return null;
-    if (
-      agent.adapterType === "acpx_local" &&
-      typeof agent.adapterConfig.agent === "string" &&
-      agent.adapterConfig.agent === "custom"
-    ) {
-      return "Paperclip cannot manage skills for custom ACP commands yet.";
-    }
-    if (agent.adapterType === "openclaw_gateway") {
-      return "Paperclip cannot manage OpenClaw skills here. Visit your OpenClaw instance to manage this agent's skills.";
-    }
-    return "Paperclip cannot manage skills for this adapter yet. Manage them in the adapter directly.";
-  }, [agent.adapterConfig.agent, agent.adapterType, skillSnapshot?.mode]);
-  const hasUnsavedChanges = !arraysEqual(skillDraft, lastSavedSkills);
-  const saveStatusLabel = syncSkills.isPending
-    ? "Saving changes..."
-    : hasUnsavedChanges
-      ? "Saving soon..."
-      : null;
-
-  return (
-    <div className="max-w-4xl space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Link
-          to="/skills"
-          className="text-sm font-medium text-foreground underline-offset-4 no-underline transition-colors hover:text-foreground/70 hover:underline"
-        >
-          View company skills library
-        </Link>
-        {saveStatusLabel ? (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            {syncSkills.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-            <span>{saveStatusLabel}</span>
-          </div>
-        ) : null}
-      </div>
-
-      {skillSnapshot?.warnings.length ? (
-        <div className="space-y-1 rounded-xl border border-amber-300/60 bg-amber-50/60 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/20 dark:text-amber-200">
-          {skillSnapshot.warnings.map((warning) => (
-            <div key={warning}>{warning}</div>
-          ))}
-        </div>
-      ) : null}
-
-      {unsupportedSkillMessage ? (
-        <div className="rounded-xl border border-border px-4 py-3 text-sm text-muted-foreground">
-          {unsupportedSkillMessage}
-        </div>
-      ) : null}
-
-      {isLoading ? (
-        <PageSkeleton variant="list" />
-      ) : (
-        <>
-          {(() => {
-            const renderSkillRow = (skill: SkillRow) => {
-              const adapterEntry = skill.adapterEntry ?? adapterEntryByKey.get(skill.key);
-              const required = Boolean(adapterEntry?.required);
-              const rowClassName = cn(
-                "flex items-start gap-3 border-b border-border px-3 py-3 text-sm last:border-b-0",
-                skill.readOnly ? "bg-muted/20" : "hover:bg-accent/20",
-              );
-              const body = (
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <span className="truncate font-medium">{skill.name}</span>
-                    </div>
-                    {skill.linkTo ? (
-                      <Link
-                        to={skill.linkTo}
-                        className="shrink-0 text-xs text-muted-foreground no-underline hover:text-foreground"
-                      >
-                        View
-                      </Link>
-                    ) : null}
-                  </div>
-                  {skill.description && (
-                    <MarkdownBody className="mt-1 text-xs text-muted-foreground prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-                      {skill.description}
-                    </MarkdownBody>
-                  )}
-                  {skill.readOnly && skill.originLabel && (
-                    <p className="mt-1 text-xs text-muted-foreground">{skill.originLabel}</p>
-                  )}
-                  {skill.readOnly && skill.locationLabel && (
-                    <p className="mt-1 text-xs text-muted-foreground">Location: {skill.locationLabel}</p>
-                  )}
-                  {skill.detail && (
-                    <p className="mt-1 text-xs text-muted-foreground">{skill.detail}</p>
-                  )}
-                </div>
-              );
-
-              if (skill.readOnly) {
-                return (
-                  <div key={skill.id} className={rowClassName}>
-                    <span className="mt-1 h-2 w-2 rounded-full bg-muted-foreground/40" />
-                    {body}
-                  </div>
-                );
-              }
-
-              const checked = required || skillDraft.includes(skill.key);
-              const disabled = required || skillSnapshot?.mode === "unsupported";
-              const checkbox = (
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  disabled={disabled}
-                  onChange={(event) => {
-                    const next = event.target.checked
-                      ? Array.from(new Set([...skillDraft, skill.key]))
-                      : skillDraft.filter((value) => value !== skill.key);
-                    setSkillDraft(next);
-                  }}
-                  className="mt-0.5 disabled:cursor-not-allowed disabled:opacity-60"
-                />
-              );
-
-              return (
-                <label key={skill.id} className={rowClassName}>
-                  {required && adapterEntry?.requiredReason ? (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span>{checkbox}</span>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">{adapterEntry.requiredReason}</TooltipContent>
-                    </Tooltip>
-                  ) : skillSnapshot?.mode === "unsupported" ? (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span>{checkbox}</span>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">
-                        {unsupportedSkillMessage ?? "Manage skills in the adapter directly."}
-                      </TooltipContent>
-                    </Tooltip>
-                  ) : (
-                    checkbox
-                  )}
-                  {body}
-                </label>
-              );
-            };
-
-            const renderSkillSection = (
-              title: string,
-              rows: SkillRow[],
-              emptyMessage?: string,
-            ) => {
-              if (rows.length === 0 && !emptyMessage) return null;
-              return (
-                <section className="border-y border-border">
-                  <div className="border-b border-border bg-muted/40 px-3 py-2">
-                    <span className="text-xs font-medium text-muted-foreground">
-                      {title}
-                    </span>
-                  </div>
-                  {rows.length > 0 ? (
-                    rows.map(renderSkillRow)
-                  ) : (
-                    <div className="px-3 py-3 text-sm text-muted-foreground">
-                      {emptyMessage}
-                    </div>
-                  )}
-                </section>
-              );
-            };
-
-            if (optionalSkillRows.length === 0 && requiredSkillRows.length === 0 && unmanagedSkillRows.length === 0) {
-              return (
-                <section className="border-y border-border">
-                  <div className="px-3 py-6 text-sm text-muted-foreground">
-                    Import skills into the company library first, then attach them here.
-                  </div>
-                </section>
-              );
-            }
-
-            return (
-              <>
-                {optionalSkillRows.length > 0
-                  ? renderSkillSection(
-                      "Installed skills",
-                      installedSkillRows,
-                      "No company-library skills installed on this agent.",
-                    )
-                  : null}
-
-                {renderSkillSection("Other skills", otherSkillRows)}
-
-                {renderSkillSection("Required by Paperclip", requiredSkillRows)}
-
-                {unmanagedSkillRows.length > 0 && (
-                  <section className="border-y border-border">
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      className="flex cursor-pointer items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 select-none"
-                      onClick={() => setUnmanagedOpen((v) => !v)}
-                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setUnmanagedOpen((v) => !v); } }}
-                    >
-                      <span className="text-xs font-medium text-muted-foreground">
-                        ({unmanagedSkillRows.length}) User-installed skills, not managed by Paperclip
-                      </span>
-                      {unmanagedOpen ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
-                    </div>
-                    {unmanagedOpen && unmanagedSkillRows.map(renderSkillRow)}
-                  </section>
-                )}
-              </>
-            );
-          })()}
-
-          {desiredOnlyMissingSkills.length > 0 && (
-            <div className="rounded-xl border border-amber-300/60 bg-amber-50/60 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/20 dark:text-amber-200">
-              <div className="font-medium">Requested skills missing from the company library</div>
-              <div className="mt-1 text-xs">
-                {desiredOnlyMissingSkills.join(", ")}
-              </div>
-            </div>
-          )}
-
-          <section className="border-t border-border pt-4">
-            <div className="grid gap-2 text-sm sm:grid-cols-2">
-              <div className="flex items-center justify-between gap-3 border-b border-border/60 py-2">
-                <span className="text-muted-foreground">Adapter</span>
-                <span className="font-medium">{adapterLabels[agent.adapterType] ?? agent.adapterType}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 border-b border-border/60 py-2">
-                <span className="text-muted-foreground">Skills applied</span>
-                <span>{skillApplicationLabel}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 border-b border-border/60 py-2">
-                <span className="text-muted-foreground">Selected skills</span>
-                <span>{skillDraft.length}</span>
-              </div>
-            </div>
-
-            {syncSkills.isError && (
-              <p className="mt-3 text-xs text-destructive">
-                {syncSkills.error instanceof Error ? syncSkills.error.message : "Failed to update skills"}
-              </p>
-            )}
-          </section>
-        </>
-      )}
+      <Skeleton className="h-(--sz-420px) w-full" />
     </div>
   );
 }
@@ -3103,17 +2788,17 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
         <span className="font-mono text-xs text-muted-foreground">
           {run.id.slice(0, 8)}
         </span>
-        <span className={cn(
-          "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium shrink-0",
+        <Badge variant="ghost" className={cn(
+          "px-1.5 text-(length:--text-nano)",
           run.invocationSource === "timer" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300"
             : run.invocationSource === "assignment" ? "bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300"
             : run.invocationSource === "on_demand" ? "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/50 dark:text-cyan-300"
             : "bg-muted text-muted-foreground"
         )}>
           {sourceLabels[run.invocationSource] ?? run.invocationSource}
-        </span>
-        {sourceResolvedFold ? <SourceResolvedFoldBadge showIcon={false} className="shrink-0 text-[10px] py-0" /> : null}
-        <span className="ml-auto text-[11px] text-muted-foreground shrink-0">
+        </Badge>
+        {sourceResolvedFold ? <SourceResolvedFoldBadge showIcon={false} className="shrink-0 text-(length:--text-nano) py-0" /> : null}
+        <span className="ml-auto text-(length:--text-micro) text-muted-foreground shrink-0">
           {relativeTime(run.createdAt)}
         </span>
       </div>
@@ -3123,7 +2808,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
         </span>
       )}
       {(metrics.totalTokens > 0 || metrics.cost > 0) && (
-        <div className="flex items-center gap-2 pl-5.5 text-[11px] text-muted-foreground tabular-nums">
+        <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
           {metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
           {metrics.cost > 0 && <span>${metrics.cost.toFixed(3)}</span>}
         </div>
@@ -3226,6 +2911,20 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   });
   const run = hydratedRun ?? initialRun;
   const metrics = runMetrics(run);
+  const { data: userDirectory } = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(run.companyId),
+    queryFn: () => accessApi.listUserDirectory(run.companyId),
+    enabled: Boolean(run.companyId && run.responsibleUserId),
+    retry: false,
+  });
+  const responsibleUserName = useMemo(() => {
+    if (!run.responsibleUserId) return null;
+    const entry = userDirectory?.users.find(
+      (candidate) => candidate.principalId === run.responsibleUserId,
+    );
+    return entry?.user?.name ?? entry?.user?.email ?? null;
+  }, [run.responsibleUserId, userDirectory]);
+  const responsibleDenialCode = isResponsibleUserDenialCode(run.errorCode) ? run.errorCode : null;
   const [sessionOpen, setSessionOpen] = useState(false);
   const [claudeLoginResult, setClaudeLoginResult] = useState<ClaudeLoginResult | null>(null);
 
@@ -3368,6 +3067,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
 
   return (
     <div className="space-y-4 min-w-0">
+      {/* Workspace-validation recovery: surfaces the recovery card when this run was declined over a
+          git workspace it could not validate, wired to the same reconcile / repair / re-issue /
+          break-glass handlers as the task detail page. */}
+      <RunWorkspaceRecoverySurface run={run} />
       {/* Run summary card */}
       <div className="border border-border rounded-lg overflow-hidden">
         <div className="flex flex-col sm:flex-row">
@@ -3419,9 +3122,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 ?? asNonEmptyString(adapterConfig?.model);
               if (!adapterType && !displayProvider && !displayModel) return null;
               return (
-                <div className="text-[11px] text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
+                <div className="text-(length:--text-micro) text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
                   {adapterType && (
-                    <span className="bg-muted rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide">{adapterType.replace(/_/g, " ")}</span>
+                    <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{adapterType.replace(/_/g, " ")}</span>
                   )}
                   {displayProvider && displayModel && (
                     <span>{displayProvider}/{displayModel}</span>
@@ -3432,6 +3135,17 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 </div>
               );
             })()}
+            {run.responsibleUserId && (
+              <div
+                data-testid="run-detail-on-behalf-of"
+                className="text-xs text-muted-foreground"
+              >
+                On behalf of{" "}
+                <span className="text-foreground">
+                  {responsibleUserName ?? responsibleUserLabel(null)}
+                </span>
+              </div>
+            )}
             {resumeRun.isError && (
               <div className="text-xs text-destructive">
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}
@@ -3449,7 +3163,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                   {endTime && <span className="text-muted-foreground"> &rarr; </span>}
                   {endTime}
                 </div>
-                <div className="text-[11px] text-muted-foreground">
+                <div className="text-(length:--text-micro) text-muted-foreground">
                   {relativeTime(run.startedAt!)}
                   {run.finishedAt && <> &rarr; {relativeTime(run.finishedAt)}</>}
                 </div>
@@ -3513,6 +3227,12 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 )}
               </div>
             )}
+            {responsibleDenialCode && (
+              <ResponsibleUserDenialNotice
+                code={responsibleDenialCode}
+                userName={responsibleUserName}
+              />
+            )}
             {hasNonZeroExit && (
               <div className="text-xs text-red-600 dark:text-red-400">
                 Exit code {run.exitCode}
@@ -3524,7 +3244,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="flex flex-wrap items-center gap-2">
                   <span
                     className={cn(
-                      "rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+                      "rounded-md border px-1.5 py-0.5 text-(length:--text-micro) font-medium",
                       retryState.tone,
                     )}
                   >
@@ -3597,7 +3317,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                   <div className="pt-1">
                     <button
                       type="button"
-                      className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:opacity-60"
+                      className="text-(length:--text-micro) text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:opacity-60"
                       disabled={clearSessionsForTouchedIssues.isPending}
                       onClick={() => {
                         const issueCount = touchedIssueIds.length;
@@ -3610,10 +3330,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                     >
                       {clearSessionsForTouchedIssues.isPending
                         ? "clearing session..."
-                        : "clear session for these issues"}
+                        : "clear session for these tasks"}
                     </button>
                     {clearSessionsForTouchedIssues.isError && (
-                      <p className="text-[11px] text-destructive mt-1">
+                      <p className="text-(length:--text-micro) text-destructive mt-1">
                         {clearSessionsForTouchedIssues.error instanceof Error
                           ? clearSessionsForTouchedIssues.error.message
                           : "Failed to clear sessions"}
@@ -3630,7 +3350,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       {/* Issues touched by this run */}
       {touchedIssues && touchedIssues.length > 0 && (
         <div className="space-y-2">
-          <span className="text-xs font-medium text-muted-foreground">Issues Touched ({touchedIssues.length})</span>
+          <span className="text-xs font-medium text-muted-foreground">Tasks Touched ({touchedIssues.length})</span>
           <div className="border border-border rounded-lg divide-y divide-border">
             {touchedIssues.map((issue) => (
               <Link
@@ -3695,6 +3415,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   const [transcriptMode, setTranscriptMode] = useState<TranscriptMode>("nice");
   const logEndRef = useRef<HTMLDivElement>(null);
   const pendingLogLineRef = useRef("");
+  const seenProgressLogLineKeysRef = useRef<Set<string>>(new Set());
   const scrollContainerRef = useRef<ScrollContainer | null>(null);
   const isFollowingRef = useRef(false);
   const lastMetricsRef = useRef<{ scrollHeight: number; distanceFromBottom: number }>({
@@ -3842,6 +3563,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   useEffect(() => {
     let cancelled = false;
     pendingLogLineRef.current = "";
+    seenProgressLogLineKeysRef.current = new Set();
     setLogLines([]);
     setLogOffset(0);
     setHasMoreLog(false);
@@ -3989,6 +3711,16 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           return;
         }
 
+        if (event.type === "heartbeat.run.progress") {
+          const line = buildHeartbeatProgressLogLine(payload, event.createdAt);
+          if (!line) return;
+          const key = heartbeatProgressLogLineKey(line);
+          if (seenProgressLogLineKeysRef.current.has(key)) return;
+          seenProgressLogLineKeysRef.current.add(key);
+          setLogLines((prev) => [...prev, line]);
+          return;
+        }
+
         if (event.type !== "heartbeat.run.event") return;
 
         const seq = typeof payload.seq === "number" ? payload.seq : null;
@@ -4123,7 +3855,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
                 key={mode}
                 type="button"
                 className={cn(
-                  "rounded-md px-2.5 py-1 text-[11px] font-medium capitalize transition-colors",
+                  "rounded-md px-2.5 py-1 text-(length:--text-micro) font-medium capitalize transition-colors",
                   transcriptMode === mode
                     ? "bg-accent text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground",
@@ -4150,17 +3882,17 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
             </Button>
           )}
           {isLive && (
-            <span className="flex items-center gap-1 text-xs text-cyan-400">
+            <span className="flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400">
               <span className="relative flex h-2 w-2">
-                <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-400" />
+                <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
               </span>
               Live
             </span>
           )}
         </div>
       </div>
-      <div className="max-h-[38rem] overflow-y-auto rounded-2xl border border-border/70 bg-background/40 p-3 sm:p-4">
+      <div className="max-h-(--sz-38rem) overflow-y-auto rounded-2xl border border-border/70 bg-background/40 p-3 sm:p-4">
         <RunTranscriptView
           entries={transcript}
           mode={transcriptMode}
