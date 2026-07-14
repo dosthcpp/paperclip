@@ -575,7 +575,16 @@ export type RoutineRunStatus = (typeof ROUTINE_RUN_STATUSES)[number];
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 
-export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived"] as const;
+export const PAUSE_REASONS = [
+  "manual",
+  "budget",
+  "system",
+  "company_archived",
+  // Hard provider billing wall (TON-3278). Distinct from "budget" (Paperclip's
+  // own spend cap) because the exhausted pool is the provider account, which no
+  // Paperclip-side budget change can refill.
+  "provider_billing_exhausted",
+] as const;
 export type PauseReason = (typeof PAUSE_REASONS)[number];
 
 export const PROJECT_COLORS = [
