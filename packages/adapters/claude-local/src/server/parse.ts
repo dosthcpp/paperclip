@@ -286,6 +286,77 @@ export function isClaudeImageProcessingError(parsed: Record<string, unknown>): b
   );
 }
 
+/**
+ * True when the CLI terminated on an API error rather than on an agent turn.
+ *
+ * Both fields are written by the runtime, never by the agent. A credit exhaustion arrives as
+ * `{subtype: "success", is_error: true, terminal_reason: "api_error", result: "<provider text>"}`
+ * -- the API call itself failed, so the run had no agent turn to author `result` with. A healthy
+ * run reads `{is_error: false, terminal_reason: "completed"}` and its `result` is the agent's own
+ * final report, which is why that shape must never unlock the text below (TON-3281).
+ */
+function isProviderAuthoredTerminal(parsed: Record<string, unknown>): boolean {
+  if (!asBoolean(parsed.is_error, false)) return false;
+  const reason = (asString(parsed.terminal_reason, "") || asString(parsed.terminalReason, ""))
+    .trim()
+    .toLowerCase();
+  return reason === "api_error";
+}
+
+/**
+ * A reset clock: the provider named the moment the window reopens, so waiting is the remedy.
+ *
+ * This -- not the wording -- is what separates the two look-alike Claude messages, both of
+ * which arrive in the identical structured shape:
+ *
+ *   "You're out of usage credits. Run /usage-credits ..."     -> hard wall  (d4940cf4, b824d2f1)
+ *   "You've hit your session limit · resets 7pm (Asia/Seoul)" -> time heals (efed1f88)
+ */
+const CLAUDE_RESET_CLOCK_RE =
+  /(?:\bresets?\b[^\n]{0,24}?(?:\d|midnight|noon|tomorrow)|limit\s+will\s+reset|retry[-\s_]?after)/i;
+
+/** Hard billing walls. No amount of waiting clears these; a human must add credits. */
+const CLAUDE_BILLING_EXHAUSTED_RE =
+  /(?:out\s+of\s+usage\s+credits|\/usage-credits\b|credit\s+balance\s+is\s+too\s+low|insufficient[\s_-]?quota|exceeded\s+your\s+current\s+quota|purchase\s+(?:more\s+)?credits|\b402\b|payment\s+required)/i;
+
+/**
+ * The structured code a hard billing wall is stamped with. The server's guard reads this as
+ * authoritative and pauses the agent on the second one (`BILLING_ERROR_CODES` in
+ * server/src/services/run-failure-class.ts); its text-matching path is the legacy fallback
+ * for runs this adapter has not stamped.
+ */
+export const CLAUDE_BILLING_EXHAUSTED_ERROR_CODE = "provider_billing_exhausted";
+
+/**
+ * Does this run stand at a hard billing wall? (TON-3323)
+ *
+ * A hard verdict is load-bearing -- two of them pause the agent, and a human must undo that --
+ * so it is drawn only from bytes the *runtime* wrote: the structured `is_error`/`terminal_reason`
+ * shape gates the provider's own terminal text. Nothing here reads stdout, stderr, or an ungated
+ * `result`. An agent that merely writes *about* running out of credits (a postmortem, this very
+ * comment) must not be able to pause itself two runs later (TON-3281 / TON-3314).
+ *
+ * A reset clock beats any billing wording in the same message. The bias is deliberate and matches
+ * the server's: a wrong "hard" verdict freezes a healthy agent, a wrong "recoverable" verdict
+ * costs one cheap retry.
+ */
+export function isClaudeBillingExhausted(input: {
+  parsed?: Record<string, unknown> | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+  if (!parsed) return false;
+  if (!isProviderAuthoredTerminal(parsed)) return false;
+
+  const providerText = [asString(parsed.result, ""), ...extractClaudeErrorMessages(parsed)]
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("\n");
+  if (!providerText) return false;
+
+  if (CLAUDE_RESET_CLOCK_RE.test(providerText)) return false;
+  return CLAUDE_BILLING_EXHAUSTED_RE.test(providerText);
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -478,9 +549,15 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudeImageProcessingError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed))) {
     return false;
   }
+  // A hard billing wall is not transient, and this precedence has to live here rather than only
+  // at the call sites: CLAUDE_TRANSIENT_UPSTREAM_RE below matches "out of usage credits" too, so
+  // without this a genuine wall was stamped `claude_transient_upstream` -- wearing a retryable
+  // label, it never reached the server's hard-failure guard, which is why that guard did not fire
+  // once during TON-3268 (TON-3323).
+  if (isClaudeBillingExhausted({ parsed })) return false;
   const loginMeta = detectClaudeLoginRequired({
     parsed,
     stdout: input.stdout ?? "",

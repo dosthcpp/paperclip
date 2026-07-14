@@ -52,10 +52,12 @@ import {
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
   isClaudeRefusalResult,
+  isClaudeBillingExhausted,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
+  CLAUDE_BILLING_EXHAUSTED_ERROR_CODE,
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
@@ -840,6 +842,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
+      // No terminal result event, so there is no runtime-authored `is_error`/`terminal_reason`
+      // shape to gate a billing verdict on -- and a hard verdict pauses the agent. We take the
+      // recoverable branch by design and let the run retry: the cost of a wrong "hard" here is a
+      // frozen healthy agent, the cost of a wrong "transient" is one cheap retry (TON-3323).
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
       const transientUpstream =
         !loginMeta.requiresLogin &&
@@ -939,11 +945,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
+    // Billing is decided before transient, and from the runtime's structured bytes alone
+    // (isClaudeBillingExhausted). A hard wall that gets stamped `claude_transient_upstream`
+    // is invisible to the server's hard-failure guard -- it reads that code as retryable --
+    // so the scheduler re-dispatches into the same wall every tick (TON-3278 / TON-3323).
+    const billingExhausted =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      isClaudeBillingExhausted({ parsed });
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
+      !billingExhausted &&
       isClaudeTransientUpstreamError({
         parsed,
         stdout: proc.stdout,
@@ -964,6 +981,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
+      : billingExhausted
+      ? CLAUDE_BILLING_EXHAUSTED_ERROR_CODE
       : transientUpstream
       ? "claude_transient_upstream"
       : claudeRefusal

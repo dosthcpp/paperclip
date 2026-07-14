@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeBillingExhausted,
   isClaudeTransientUpstreamError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeRefusalResult,
@@ -257,7 +258,24 @@ describe("claude_local classifiers do not read agent-authored bytes", () => {
   });
 
   it("still classifies a genuine upstream failure from the CLI's own result text", () => {
-    expect(isClaudeTransientUpstreamError({ parsed: { ...RUN_BC_CREDITS_EXHAUSTED } })).toBe(true);
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          terminal_reason: "api_error",
+          result: "API Error: 529 overloaded_error · the service is temporarily unavailable",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("no longer calls a hard credit wall transient (TON-3323)", () => {
+    // This assertion is inverted on purpose. The transient regex matches "out of usage credits",
+    // so runs d4940cf4 / b824d2f1 were stamped `claude_transient_upstream` -- a retryable label.
+    // Wearing it, they never reached the server's hard-failure guard, which is why that guard did
+    // not fire once during the incident it was written for.
+    expect(isClaudeTransientUpstreamError({ parsed: { ...RUN_BC_CREDITS_EXHAUSTED } })).toBe(false);
   });
 
   it("classifies the session-limit wording and recovers its reset time for backoff", () => {
@@ -275,6 +293,76 @@ describe("claude_local classifiers do not read agent-authored bytes", () => {
     const retryAt = extractClaudeRetryNotBefore({ parsed }, now);
     expect(retryAt).not.toBeNull();
     expect(retryAt!.toISOString()).toBe("2026-07-14T10:00:00.000Z"); // 19:00 Asia/Seoul
+  });
+});
+
+describe("isClaudeBillingExhausted (TON-3323)", () => {
+  // Verbatim from run efed1f88: the same structured shape as a hard wall, but the provider named
+  // the moment the window reopens. Time is the remedy, so it must stay retryable.
+  const RUN_EFED_SESSION_LIMIT = {
+    subtype: "success",
+    is_error: true,
+    terminal_reason: "api_error",
+    result: "You've hit your session limit · resets 7pm (Asia/Seoul)",
+  } as const;
+
+  it("stamps a real credit exhaustion as a hard wall (runs d4940cf4 / b824d2f1)", () => {
+    expect(isClaudeBillingExhausted({ parsed: { ...RUN_BC_CREDITS_EXHAUSTED } })).toBe(true);
+  });
+
+  it("leaves a session limit with a reset clock recoverable (run efed1f88)", () => {
+    // The reset clock wins over the "limit" wording -- and this run keeps its transient label
+    // and its backoff, so nothing about its retry path changes.
+    expect(isClaudeBillingExhausted({ parsed: { ...RUN_EFED_SESSION_LIMIT } })).toBe(false);
+    expect(isClaudeTransientUpstreamError({ parsed: { ...RUN_EFED_SESSION_LIMIT } })).toBe(true);
+  });
+
+  it("does not let an agent's own prose about credits convict its run (run ee3e588a)", () => {
+    // The false-pause vector. A healthy run's `result` IS the agent's final report, so billing
+    // wording there is the agent talking -- and two hard verdicts pause the agent for a human to
+    // undo. Provenance, not wording, is what gates the verdict (TON-3281 / TON-3314).
+    const agentPostmortem = {
+      subtype: "success",
+      is_error: false,
+      terminal_reason: "completed",
+      result:
+        "TON-3278 is fixed. The hot loop happened because the CTO agent was out of usage credits " +
+        "and the reconciler kept re-dispatching it. Run /usage-credits does not apply here; " +
+        "HTTP 402 was never returned.",
+    };
+    expect(isClaudeBillingExhausted({ parsed: agentPostmortem })).toBe(false);
+  });
+
+  it("ignores billing wording that is not gated by the runtime's api_error shape", () => {
+    // is_error alone is not provenance: a failed run's `result` can still be agent-authored.
+    expect(
+      isClaudeBillingExhausted({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          terminal_reason: "completed",
+          result: "You're out of usage credits. Run /usage-credits to keep using Fable 5.",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("reads the CLI's structured errors[] as provider-authored", () => {
+    expect(
+      isClaudeBillingExhausted({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          terminal_reason: "api_error",
+          errors: [{ message: "Your credit balance is too low to access the Anthropic API" }],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("draws no verdict when the CLI died before emitting a terminal result", () => {
+    // No structured shape, no provenance, no hard verdict -- however the stdout reads.
+    expect(isClaudeBillingExhausted({ parsed: null })).toBe(false);
   });
 });
 
