@@ -385,7 +385,11 @@ describeEmbeddedPostgres("authorization service", () => {
     const company = await createCompany(db, "Legacy");
     const actorAgent = await createAgent(db, company.id, { role: "ceo" });
 
-    const decision = await authorizationService(db).decide({
+    const managedAgent = await createAgent(db, company.id, { role: "engineer" });
+
+    const service = authorizationService(db);
+
+    const decision = await service.decide({
       actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
       action: "agents:create",
       resource: { type: "company", companyId: company.id },
@@ -395,6 +399,59 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: true,
       reason: "allow_legacy_agent_creator",
     });
+
+    const issueMutationDecision = await service.decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:manage_active_checkouts",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: managedAgent.id },
+    });
+
+    expect(issueMutationDecision).toMatchObject({
+      allowed: true,
+      reason: "allow_legacy_agent_creator",
+    });
+  });
+
+  it("allows active-checkout management only inside the actor's real reporting subtree", async () => {
+    const company = await createCompany(db, "CheckoutManagementSubtree");
+    const manager = await createAgent(db, company.id, { role: "manager" });
+    const directReport = await createAgent(db, company.id, { reportsTo: manager.id });
+    const deepReport = await createAgent(db, company.id, { reportsTo: directReport.id });
+    const outsider = await createAgent(db, company.id);
+    const service = authorizationService(db);
+
+    for (const assigneeAgentId of [directReport.id, deepReport.id]) {
+      const decision = await service.decide({
+        actor: { type: "agent", agentId: manager.id, companyId: company.id, source: "agent_jwt" },
+        action: "tasks:manage_active_checkouts",
+        resource: { type: "issue", companyId: company.id, assigneeAgentId },
+      });
+
+      expect(decision).toMatchObject({ allowed: true, reason: "allow_manager_chain" });
+    }
+
+    const denied = await service.decide({
+      actor: { type: "agent", agentId: manager.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:manage_active_checkouts",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: outsider.id },
+    });
+
+    expect(denied).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("rejects active-checkout management across the company boundary", async () => {
+    const company = await createCompany(db, "CheckoutManagementSource");
+    const foreignCompany = await createCompany(db, "CheckoutManagementForeign");
+    const manager = await createAgent(db, company.id, { role: "manager" });
+    const foreignAgent = await createAgent(db, foreignCompany.id, { reportsTo: manager.id });
+    const service = authorizationService(db);
+
+    const crossCompany = await service.decide({
+      actor: { type: "agent", agentId: manager.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:manage_active_checkouts",
+      resource: { type: "issue", companyId: foreignCompany.id, assigneeAgentId: foreignAgent.id },
+    });
+    expect(crossCompany).toMatchObject({ allowed: false, reason: "deny_company_boundary" });
   });
 
   it("allows scoped assignment inside a granted project and denies other projects", async () => {

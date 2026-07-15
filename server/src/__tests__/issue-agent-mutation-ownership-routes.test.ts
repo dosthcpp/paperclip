@@ -13,6 +13,7 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  checkout: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
   getAttachmentById: vi.fn(),
@@ -173,6 +174,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     parentId: null,
     assigneeAgentId: ownerAgentId,
     assigneeUserId: null,
+    createdByAgentId: null,
     createdByUserId: "board-user",
     identifier: "PAP-1649",
     title: "Owned active issue",
@@ -292,6 +294,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.checkout.mockReset();
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
     mockIssueService.getAttachmentById.mockReset();
@@ -371,6 +374,9 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.checkout.mockImplementation(async (_id: string, agentId: string) =>
+      makeIssue({ status: "in_progress", assigneeAgentId: agentId }),
+    );
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -704,6 +710,57 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows a reporting-chain manager to checkout an assigned report's issue and wake that report", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "allow_manager_chain" : "deny_missing_grant",
+      explanation: input.action === "tasks:manage_active_checkouts" ? "Managed reporting subtree." : "Missing permission.",
+    }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: ownerAgentId, expectedStatuses: ["todo"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      ownerAgentId,
+      ["todo"],
+      peerActor().runId,
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ownerAgentId,
+      expect.objectContaining({ reason: "issue_checked_out" }),
+    );
+  });
+
+  it("rejects checkout agentId spoofing when the target is outside the actor's reporting subtree", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: ownerAgentId, expectedStatuses: ["todo"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent can only checkout as itself or a managed assignee");
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Creator update" })],
+    ["comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Creator update" })],
+    ["delete", (app: express.Express) => request(app).delete(`/api/issues/${issueId}`)],
+  ])("allows the creating agent to %s an issue assigned to another agent", async (_kind, sendRequest) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ createdByAgentId: peerAgentId }));
+
+    const res = await sendRequest(await createApp(peerActor()));
+
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
   });
 
   it.each([

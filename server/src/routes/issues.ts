@@ -1496,7 +1496,13 @@ export function issueRoutes(
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    issue: {
+      id: string;
+      companyId: string;
+      status: string;
+      assigneeAgentId: string | null;
+      createdByAgentId?: string | null;
+    },
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -1505,6 +1511,9 @@ export function issueRoutes(
       return false;
     }
     if (issue.assigneeAgentId === null) {
+      return true;
+    }
+    if (issue.createdByAgentId === actorAgentId) {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
@@ -5065,8 +5074,15 @@ export function issueRoutes(
     }
 
     if (req.actor.type === "agent" && req.actor.agentId !== req.body.agentId) {
-      res.status(403).json({ error: "Agent can only checkout as itself" });
-      return;
+      const actorAgentId = req.actor.agentId;
+      const canCheckoutForManagedAssignee =
+        actorAgentId &&
+        issue.assigneeAgentId === req.body.agentId &&
+        await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, req.body.agentId);
+      if (!canCheckoutForManagedAssignee) {
+        res.status(403).json({ error: "Agent can only checkout as itself or a managed assignee" });
+        return;
+      }
     }
 
     if (issue.assigneeAgentId !== req.body.agentId) {
