@@ -246,6 +246,13 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     });
     expect(blockedWakeRequest).toBe(true);
 
+    const blockedIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blockedIssue?.status).toBe("blocked");
+
     const blockedRunsBeforeResolution = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(heartbeatRuns)

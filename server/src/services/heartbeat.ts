@@ -9483,6 +9483,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
+          // Keep the board state aligned with the dependency gate. Without this,
+          // assigned todo issues can be rejected indefinitely while still looking
+          // like ready work. The normal blocker-resolution path will move blocked
+          // dependents back to todo once every blocker is done.
+          if (issue.status === "todo") {
+            await tx
+              .update(issues)
+              .set({ status: "blocked", updatedAt: new Date() })
+              .where(and(eq(issues.id, issue.id), eq(issues.status, "todo")));
+          }
+
+          const unresolvedBlockers = await listUnresolvedBlockerSummaries(
+            tx,
+            issue.companyId,
+            issue.id,
+            dependencyReadiness.unresolvedBlockerIssueIds,
+          );
+          const cancelledBlockers = unresolvedBlockers.filter((blocker) => blocker.status === "cancelled");
+          if (cancelledBlockers.length > 0) {
+            logger.warn(
+              {
+                issueId: issue.id,
+                cancelledBlockerIssueIds: cancelledBlockers.map((blocker) => blocker.id),
+              },
+              "Dependency gate remains closed by cancelled blocker relationships",
+            );
+          }
+
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
@@ -9493,6 +9521,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...(payload ?? {}),
               issueId,
               unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds,
+              cancelledBlockerIssueIds: cancelledBlockers.map((blocker) => blocker.id),
             },
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
