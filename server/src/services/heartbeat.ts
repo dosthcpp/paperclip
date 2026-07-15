@@ -6111,6 +6111,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
+    const startupRecoveryResumeAfter = readNonEmptyString(
+      parseObject(run.contextSnapshot)[STARTUP_RECOVERY_RESUME_AFTER_KEY],
+    );
+    if (startupRecoveryResumeAfter) {
+      const resumeAfter = Date.parse(startupRecoveryResumeAfter);
+      if (Number.isFinite(resumeAfter) && resumeAfter > Date.now()) return null;
+    }
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
@@ -6776,8 +6783,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  const STARTUP_RECOVERY_STORM_WINDOW_MS = 5 * 60 * 1000;
+  const STARTUP_RECOVERY_STORM_THRESHOLD = 3;
+  const STARTUP_RECOVERY_HISTORY_KEY = "startupRecoveryTimestamps";
+  const STARTUP_RECOVERY_RESUME_AFTER_KEY = "startupRecoveryResumeAfter";
+
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; recoverOnStartup?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const recoverOnStartup = opts?.recoverOnStartup ?? false;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -6792,6 +6805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.status, "running"));
 
     const reaped: string[] = [];
+    let resumeAfterMs = 0;
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
@@ -6834,6 +6848,88 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pid: run.processPid,
           processGroupId: run.processGroupId,
         });
+      }
+
+      if (recoverOnStartup) {
+        const contextSnapshot = parseObject(run.contextSnapshot);
+        const cutoff = now.getTime() - STARTUP_RECOVERY_STORM_WINDOW_MS;
+        const priorRecoveryTimestamps = Array.isArray(contextSnapshot[STARTUP_RECOVERY_HISTORY_KEY])
+          ? contextSnapshot[STARTUP_RECOVERY_HISTORY_KEY]
+              .filter((value): value is string => typeof value === "string")
+              .filter((value) => {
+                const timestamp = Date.parse(value);
+                return Number.isFinite(timestamp) && timestamp >= cutoff;
+              })
+          : [];
+        const startupRecoveryTimestamps = [...priorRecoveryTimestamps, now.toISOString()];
+        const oldestRecoveryAt = Date.parse(startupRecoveryTimestamps[0] ?? now.toISOString());
+        const runResumeAfterMs = startupRecoveryTimestamps.length >= STARTUP_RECOVERY_STORM_THRESHOLD
+          ? Math.max(0, oldestRecoveryAt + STARTUP_RECOVERY_STORM_WINDOW_MS - now.getTime())
+          : 0;
+        const startupRecoveryResumeAfter = runResumeAfterMs > 0
+          ? new Date(now.getTime() + runResumeAfterMs).toISOString()
+          : null;
+
+        const recovered = await db.transaction(async (tx) => {
+          const recoveredRun = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "queued",
+              startedAt: null,
+              finishedAt: null,
+              error: null,
+              errorCode: null,
+              exitCode: null,
+              signal: null,
+              usageJson: null,
+              resultJson: null,
+              sessionIdAfter: null,
+              externalRunId: null,
+              processPid: null,
+              processGroupId: null,
+              processStartedAt: null,
+              lastOutputAt: null,
+              lastOutputSeq: 0,
+              lastOutputStream: null,
+              lastOutputBytes: null,
+              stdoutExcerpt: null,
+              stderrExcerpt: null,
+              livenessState: null,
+              livenessReason: null,
+              lastUsefulActionAt: null,
+              nextAction: null,
+              contextSnapshot: {
+                ...contextSnapshot,
+                [STARTUP_RECOVERY_HISTORY_KEY]: startupRecoveryTimestamps,
+                [STARTUP_RECOVERY_RESUME_AFTER_KEY]: startupRecoveryResumeAfter,
+              },
+              updatedAt: now,
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+            .returning({ id: heartbeatRuns.id })
+            .then((rows) => rows[0] ?? null);
+          if (!recoveredRun) return false;
+
+          if (run.wakeupRequestId) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "queued",
+                claimedAt: null,
+                finishedAt: null,
+                error: null,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+          }
+          return true;
+        });
+        if (!recovered) continue;
+
+        resumeAfterMs = Math.max(resumeAfterMs, runResumeAfterMs);
+        runningProcesses.delete(run.id);
+        reaped.push(run.id);
+        continue;
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
@@ -6902,7 +6998,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
-    return { reaped: reaped.length, runIds: reaped };
+    return { reaped: reaped.length, runIds: reaped, resumeAfterMs };
   }
 
   async function resumeQueuedRuns() {

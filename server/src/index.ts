@@ -723,10 +723,21 @@ export async function startServer(): Promise<StartedServer> {
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
-      .reapOrphanedRuns()
-      .then(() => heartbeat.promoteDueScheduledRetries())
-      .then(async (promotion) => {
+      .reapOrphanedRuns({ recoverOnStartup: true })
+      .then(async (startupRecovery) => {
+        const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
+        if (startupRecovery.resumeAfterMs > 0) {
+          logger.warn(
+            { resumeAfterMs: startupRecovery.resumeAfterMs, recoveredRunIds: startupRecovery.runIds },
+            "startup recovery storm detected; delaying recovered heartbeat runs",
+          );
+          setTimeout(() => {
+            void heartbeat.resumeQueuedRuns().catch((err) => {
+              logger.error({ err }, "delayed startup heartbeat resume failed");
+            });
+          }, startupRecovery.resumeAfterMs);
+        }
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||

@@ -951,6 +951,84 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("returns startup-orphaned runs to the same queue without spending process-loss retry budget", async () => {
+    const { agentId, runId, wakeupRequestId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      runErrorCode: "process_detached",
+      runError: "stale diagnostic",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ recoverOnStartup: true });
+
+    expect(result).toMatchObject({ reaped: 1, runIds: [runId], resumeAfterMs: 0 });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      id: runId,
+      status: "queued",
+      processLossRetryCount: 1,
+      processPid: null,
+      processGroupId: null,
+      error: null,
+      errorCode: null,
+      startedAt: null,
+      finishedAt: null,
+    });
+    expect(runs[0]?.contextSnapshot).toMatchObject({
+      issueId,
+      startupRecoveryTimestamps: [expect.any(String)],
+      startupRecoveryResumeAfter: null,
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "queued", claimedAt: null, finishedAt: null, error: null });
+  });
+
+  it("enforces the startup recovery circuit in the common queued-run dispatch path", async () => {
+    const now = Date.now();
+    const { runId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      contextSnapshot: {
+        startupRecoveryTimestamps: [
+          new Date(now - 60_000).toISOString(),
+          new Date(now - 30_000).toISOString(),
+        ],
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ recoverOnStartup: true });
+    expect(result.resumeAfterMs).toBeGreaterThan(3 * 60_000);
+    expect(result.resumeAfterMs).toBeLessThanOrEqual(4 * 60_000);
+
+    await heartbeat.resumeQueuedRuns();
+    expect((await heartbeat.getRun(runId))?.status).toBe("queued");
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const queuedRun = await heartbeat.getRun(runId);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          ...(queuedRun?.contextSnapshot ?? {}),
+          startupRecoveryResumeAfter: new Date(now - 1).toISOString(),
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForRunToSettle(heartbeat, runId);
+    expect(settled?.status).toBe("succeeded");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,
