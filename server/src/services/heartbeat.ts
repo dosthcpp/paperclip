@@ -9580,14 +9580,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
           // Keep the board state aligned with the dependency gate. Without this,
-          // assigned todo issues can be rejected indefinitely while still looking
+          // assigned runnable issues can be rejected indefinitely while still looking
           // like ready work. The normal blocker-resolution path will move blocked
           // dependents back to todo once every blocker is done.
-          if (issue.status === "todo") {
+          if (issue.status === "todo" || issue.status === "in_progress") {
             await tx
               .update(issues)
               .set({ status: "blocked", updatedAt: new Date() })
-              .where(and(eq(issues.id, issue.id), eq(issues.status, "todo")));
+              .where(and(eq(issues.id, issue.id), inArray(issues.status, ["todo", "in_progress"])));
           }
 
           const unresolvedBlockers = await listUnresolvedBlockerSummaries(

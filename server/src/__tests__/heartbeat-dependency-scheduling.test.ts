@@ -153,7 +153,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await tempDb?.cleanup();
   });
 
-  it("keeps blocked descendants idle until their blockers resolve", async () => {
+  it.each(["todo", "in_progress"] as const)(
+    "keeps %s descendants idle until their blockers resolve",
+    async (initialStatus) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const blockerId = randomUUID();
@@ -187,7 +189,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         id: blockerId,
         companyId,
         title: "Mission 0",
-        status: "todo",
+        status: initialStatus,
         priority: "high",
       },
       {
@@ -404,7 +406,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       return rows.every((run) => run.status !== "queued" && run.status !== "running");
     }, 10_000);
     expect(noActiveRuns).toBe(true);
-  });
+    },
+  );
 
   it("honors maxConcurrentRuns 1 by leaving a second assignment wake queued", async () => {
     const companyId = randomUUID();
