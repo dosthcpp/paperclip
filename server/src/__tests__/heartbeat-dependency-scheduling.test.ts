@@ -189,14 +189,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         id: blockerId,
         companyId,
         title: "Mission 0",
-        status: initialStatus,
+        status: "todo",
         priority: "high",
       },
       {
         id: blockedIssueId,
         companyId,
         title: "Mission 2",
-        status: "todo",
+        status: initialStatus,
         priority: "medium",
         assigneeAgentId: agentId,
       },
@@ -331,7 +331,6 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       createdByRunId: readyWake!.id,
       body: "Ready dependency scheduling run complete.",
     });
-    finishReadyRun();
 
     await waitForCondition(async () => {
       const run = await db
@@ -339,7 +338,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, readyWake!.id))
         .then((rows) => rows[0] ?? null);
-      return run?.status === "succeeded";
+      return run?.status === "running";
     });
 
     const readyRun = await db
@@ -348,7 +347,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(eq(heartbeatRuns.id, readyWake!.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(readyRun?.status).toBe("succeeded");
+    expect(readyRun?.status).toBe("running");
 
     await db
       .update(issues)
@@ -367,6 +366,31 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       },
     });
     expect(promotedWake).not.toBeNull();
+
+    const queuedPromotedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, promotedWake!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(queuedPromotedRun?.status).toBe("queued");
+
+    const promotedBlockedIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(promotedBlockedIssue?.status).toBe("todo");
+
+    finishReadyRun();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, readyWake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
 
     await waitForCondition(async () => {
       const run = await db

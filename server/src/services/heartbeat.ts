@@ -9558,6 +9558,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           tx,
         ).then((rows) => rows.get(issue.id) ?? null);
 
+        if (
+          !activeExecutionRun &&
+          dependencyReadiness?.isDependencyReady &&
+          issue.status === "blocked" &&
+          reason === "issue_blockers_resolved"
+        ) {
+          await tx
+            .update(issues)
+            .set({ status: "todo", updatedAt: new Date() })
+            .where(and(eq(issues.id, issue.id), eq(issues.status, "blocked")));
+        }
+
         // Blocked descendants should stay idle until the final blocker resolves.
         // Human comment/mention wakes are the exception: they may run in a
         // bounded interaction mode so the assignee can answer or triage.
