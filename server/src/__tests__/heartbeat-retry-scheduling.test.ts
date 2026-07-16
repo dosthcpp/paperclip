@@ -823,22 +823,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }).where(eq(issues.id, issueId));
 
     // Keep the new agent's queue from auto-claiming/executing during this unit test.
-    await db.insert(heartbeatRuns).values(
-      Array.from({ length: 5 }, () => ({
-        id: randomUUID(),
-        companyId,
-        agentId: newAgentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "running",
-        contextSnapshot: {
-          wakeReason: "test_busy_slot",
-        },
-        startedAt: now,
-        updatedAt: now,
-        createdAt: now,
-      })),
-    );
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: newAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: {
+        wakeReason: "test_busy_slot",
+      },
+      startedAt: now,
+      updatedAt: now,
+      createdAt: now,
+    });
 
     const newAssigneeRun = await heartbeat.wakeup(newAgentId, {
       source: "assignment",
