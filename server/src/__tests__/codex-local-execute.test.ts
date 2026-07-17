@@ -106,6 +106,8 @@ describe("codex execute", () => {
       "default",
       "companies",
       "company-1",
+      "agents",
+      "agent-1",
       "codex-home",
     );
     await fs.mkdir(workspace, { recursive: true });
@@ -168,7 +170,10 @@ describe("codex execute", () => {
       expect((await fs.lstat(managedAuth)).isSymbolicLink()).toBe(true);
       expect(await fs.realpath(managedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(managedConfig)).isFile()).toBe(true);
-      expect(await fs.readFile(managedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
+      const managedConfigContents = await fs.readFile(managedConfig, "utf8");
+      expect(managedConfigContents).toContain('model = "codex-mini-latest"');
+      expect(managedConfigContents).toContain("[shell_environment_policy]");
+      expect(managedConfigContents).toContain('PAPERCLIP_API_KEY = "run-jwt-token"');
       await expect(fs.lstat(path.join(sharedCodexHome, "companies", "company-1"))).rejects.toThrow();
       expect(logs).toContainEqual(
         expect.objectContaining({
@@ -1054,6 +1059,8 @@ describe("codex execute", () => {
       "worktree-1",
       "companies",
       "company-1",
+      "agents",
+      "agent-1",
       "codex-home",
     );
     const homeSkill = path.join(isolatedCodexHome, "skills", "paperclip");
@@ -1116,12 +1123,12 @@ describe("codex execute", () => {
       expect(capture.paperclipEnvKeys).toEqual(
         expect.arrayContaining([
           "PAPERCLIP_AGENT_ID",
-          "PAPERCLIP_API_KEY",
           "PAPERCLIP_API_URL",
           "PAPERCLIP_COMPANY_ID",
           "PAPERCLIP_RUN_ID",
         ]),
       );
+      expect(capture.paperclipEnvKeys).not.toContain("PAPERCLIP_API_KEY");
 
       const isolatedAuth = path.join(isolatedCodexHome, "auth.json");
       const isolatedConfig = path.join(isolatedCodexHome, "config.toml");
@@ -1129,7 +1136,10 @@ describe("codex execute", () => {
       expect((await fs.lstat(isolatedAuth)).isSymbolicLink()).toBe(true);
       expect(await fs.realpath(isolatedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(isolatedConfig)).isFile()).toBe(true);
-      expect(await fs.readFile(isolatedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
+      const isolatedConfigContents = await fs.readFile(isolatedConfig, "utf8");
+      expect(isolatedConfigContents).toContain('model = "codex-mini-latest"');
+      expect(isolatedConfigContents).toContain("[shell_environment_policy]");
+      expect(isolatedConfigContents).toContain('PAPERCLIP_API_KEY = "run-jwt-token"');
       expect((await fs.lstat(homeSkill)).isSymbolicLink()).toBe(true);
       expect(logs).toContainEqual(
         expect.objectContaining({
