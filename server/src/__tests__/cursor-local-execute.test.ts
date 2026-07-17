@@ -42,7 +42,7 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeSandboxCursorAgent(commandPath: string, capturePath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 
 const payload = {
@@ -334,9 +334,6 @@ describe("cursor execute", () => {
     await fs.mkdir(remoteWorkspace, { recursive: true });
     await writeFakeSandboxCursorAgent(cursorAgentPath, capturePath);
 
-    const previousHome = process.env.HOME;
-    process.env.HOME = homeDir;
-
     try {
       const result = await execute({
         runId: "run-sandbox-1",
@@ -364,6 +361,7 @@ describe("cursor execute", () => {
           command: "agent",
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
+          env: { HOME: homeDir },
         },
         context: {},
         authToken: "run-jwt-token",
@@ -381,8 +379,6 @@ describe("cursor execute", () => {
       expect(capture.path.split(":")[0]).toBe(path.join(homeDir, ".local", "bin"));
       expect(capture.prompt).toContain("Follow the paperclip heartbeat.");
     } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });
     }
   }, 10_000);
@@ -399,9 +395,6 @@ describe("cursor execute", () => {
     await fs.mkdir(remoteWorkspace, { recursive: true });
     await writeFakeSandboxCursorAgent(cursorAgentPath, path.join(root, "unused.json"));
     await writeFakeSandboxCursorAgent(customCommandPath, capturePath);
-
-    const previousHome = process.env.HOME;
-    process.env.HOME = homeDir;
 
     try {
       const result = await execute({
@@ -430,6 +423,7 @@ describe("cursor execute", () => {
           command: customCommandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
+          env: { HOME: homeDir },
         },
         context: {},
         authToken: "run-jwt-token",
@@ -440,8 +434,6 @@ describe("cursor execute", () => {
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as { command: string };
       expect(capture.command).toBe(customCommandPath);
     } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });
     }
   });

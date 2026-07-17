@@ -29,7 +29,7 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
@@ -192,9 +192,6 @@ describe("cursor environment diagnostics", () => {
     await fs.mkdir(remoteCwd, { recursive: true });
     await writeFakeCursorAgentCommand(cursorAgentPath);
 
-    const previousHome = process.env.HOME;
-    process.env.HOME = homeDir;
-
     try {
       const result = await testEnvironment({
         companyId: "company-1",
@@ -211,6 +208,7 @@ describe("cursor environment diagnostics", () => {
           cwd: remoteCwd,
           env: {
             CURSOR_API_KEY: "test-key",
+            HOME: homeDir,
             PAPERCLIP_TEST_ARGS_PATH: argsCapturePath,
           },
         },
@@ -225,8 +223,6 @@ describe("cursor environment diagnostics", () => {
       expect(capture.command).toBe(cursorAgentPath);
       expect(capture.path.split(":")[0]).toBe(path.join(homeDir, ".local", "bin"));
     } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });
     }
   });
