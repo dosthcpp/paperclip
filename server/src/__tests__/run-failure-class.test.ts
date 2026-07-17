@@ -247,3 +247,133 @@ describe("buildProviderBillingPauseReason", () => {
     expect(buildProviderBillingPauseReason(null)).toContain("top up provider credits");
   });
 });
+
+// TON-3327: the unlock was a single value (`api_error`) out of the CLI's 19-value
+// terminal_reason enum. A credit wall that arrives as `blocking_limit` therefore kept
+// the trusted text locked, fell through to the adapter's mislabelled
+// `claude_transient_upstream`, was read as recoverable, and the dispatch hot-loop kept
+// burning money — DEFECT 2 re-entering under a different enum value.
+describe("classifyRunFailure — blocking_limit terminals (TON-3327)", () => {
+  /** A credit wall delivered under `blocking_limit` instead of `api_error`. */
+  const blockingLimitWall = {
+    status: "failed",
+    errorCode: "claude_transient_upstream",
+    error:
+      "Claude run failed: subtype=success: You're out of usage credits. " +
+      "Run /usage-credits to add more.",
+    resultJson: {
+      subtype: "success",
+      is_error: true,
+      terminal_reason: "blocking_limit",
+      result: "You're out of usage credits. Run /usage-credits to add more.",
+    },
+  };
+
+  /** The soft limit arrives under the same terminal reason — told apart by the clock. */
+  const blockingLimitSessionWall = {
+    status: "failed",
+    errorCode: "claude_transient_upstream",
+    error: "Claude run failed: subtype=success: You've hit your session limit · resets 7pm",
+    resultJson: {
+      subtype: "success",
+      is_error: true,
+      terminal_reason: "blocking_limit",
+      result: "You've hit your session limit · resets 7pm (Asia/Seoul)",
+    },
+  };
+
+  // AC1
+  it("classifies a blocking_limit credit wall as a hard billing wall", () => {
+    expect(classifyRunFailure(blockingLimitWall)).toBe("provider_billing_exhausted");
+    expect(isUnrecoverableRunFailure(classifyRunFailure(blockingLimitWall))).toBe(true);
+  });
+
+  it("pauses the agent once the blocking_limit wall repeats — the hot loop stops", () => {
+    const consecutive = countLeadingProviderBillingFailures([blockingLimitWall, blockingLimitWall]);
+    expect(consecutive).toBe(PROVIDER_BILLING_PAUSE_THRESHOLD);
+    expect(decideProviderBillingPause({ consecutiveFailures: consecutive })).toBe(true);
+  });
+
+  it("quotes the provider's words, not the agent's, on the paused agent", () => {
+    expect(readProviderAuthoredFailureText(blockingLimitWall)).toBe(
+      "You're out of usage credits. Run /usage-credits to add more.",
+    );
+  });
+
+  // AC2 — the reset clock still wins, so widening the unlock adds no false-pause path.
+  it("keeps a blocking_limit session limit recoverable when a reset clock is present", () => {
+    expect(classifyRunFailure(blockingLimitSessionWall)).toBe("provider_rate_limited");
+    const consecutive = countLeadingProviderBillingFailures([
+      blockingLimitSessionWall,
+      blockingLimitSessionWall,
+    ]);
+    expect(decideProviderBillingPause({ consecutiveFailures: consecutive })).toBe(false);
+  });
+
+  // AC3 — the trust boundary is unchanged: agent prose still cannot convict.
+  it("still refuses a hard verdict from agent prose under a blocking_limit terminal", () => {
+    // is_error=false => an agent turn ran => `result` is the agent's own report.
+    const agentPostmortem = {
+      status: "failed",
+      errorCode: "claude_transient_upstream",
+      error:
+        "Claude run failed: subtype=success: I fixed TON-3327. Note: the fleet was " +
+        "out of usage credits earlier, so /usage-credits may need a top-up.",
+      resultJson: {
+        subtype: "success",
+        is_error: false,
+        terminal_reason: "blocking_limit",
+        result:
+          "I fixed TON-3327. Note: the fleet was out of usage credits earlier, so " +
+          "/usage-credits may need a top-up.",
+      },
+    };
+    expect(classifyRunFailure(agentPostmortem)).toBe("transient_upstream");
+    expect(countLeadingProviderBillingFailures([agentPostmortem, agentPostmortem])).toBe(0);
+    expect(readProviderAuthoredFailureText(agentPostmortem)).toBeNull();
+  });
+
+  it("keeps the gate shut for terminals an agent's turn could have authored", () => {
+    // A hook is agent-writable, so hook output must never earn a hard verdict —
+    // even though the runtime sets the terminal reason.
+    const hookStopped = {
+      status: "failed",
+      errorCode: "claude_transient_upstream",
+      error: "Claude run failed",
+      resultJson: {
+        is_error: true,
+        terminal_reason: "hook_stopped",
+        result: "Hook says: You're out of usage credits. Run /usage-credits to add more.",
+      },
+    };
+    expect(classifyRunFailure(hookStopped)).toBe("transient_upstream");
+    expect(readProviderAuthoredFailureText(hookStopped)).toBeNull();
+
+    // budget_exhausted is a CLI-local spend cap, not a provider refusal.
+    const localBudgetCap = {
+      status: "failed",
+      errorCode: null,
+      error: "Claude run failed",
+      resultJson: {
+        is_error: true,
+        terminal_reason: "budget_exhausted",
+        result: "Budget exhausted for this session.",
+      },
+    };
+    expect(classifyRunFailure(localBudgetCap)).toBe("unclassified");
+  });
+
+  it("accepts the camelCase spelling of the terminal reason too", () => {
+    expect(
+      classifyRunFailure({
+        status: "failed",
+        errorCode: "claude_transient_upstream",
+        resultJson: {
+          is_error: true,
+          terminalReason: "blocking_limit",
+          result: "You're out of usage credits. Run /usage-credits to add more.",
+        },
+      }),
+    ).toBe("provider_billing_exhausted");
+  });
+});
