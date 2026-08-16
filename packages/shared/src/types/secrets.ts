@@ -97,11 +97,19 @@ export interface VaultProviderConfig {
   secretPathPrefix?: string | null;
 }
 
+export interface OciVaultProviderConfig {
+  region: string;
+  vaultOcid: string;
+  compartmentOcid?: string | null;
+  secretOcidPrefix?: string | null;
+}
+
 export type SecretProviderConfigPayload =
   | LocalEncryptedProviderConfig
   | AwsSecretsManagerProviderConfig
   | GcpSecretManagerProviderConfig
-  | VaultProviderConfig;
+  | VaultProviderConfig
+  | OciVaultProviderConfig;
 
 export interface SecretProviderConfigHealthDetails {
   code: string;

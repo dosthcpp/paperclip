@@ -31,7 +31,7 @@ describe("secret validators", () => {
     expect(parsed.externalRef).toContain(":secret:shared/other");
   });
 
-  it("accepts non-sensitive local and AWS provider vault metadata", () => {
+  it("accepts non-sensitive local, AWS, and OCI provider vault metadata", () => {
     expect(() =>
       createSecretProviderConfigSchema.parse({
         provider: "local_encrypted",
@@ -48,6 +48,18 @@ describe("secret validators", () => {
           region: "us-east-1",
           namespace: "production",
           secretNamePrefix: "paperclip",
+        },
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "oci_vault",
+        displayName: "OCI",
+        config: {
+          region: "ap-seoul-1",
+          vaultOcid: "ocid1.vault.oc1.ap-seoul-1.example",
+          secretOcidPrefix: "ocid1.vaultsecret.oc1.ap-seoul-1.",
         },
       }),
     ).not.toThrow();

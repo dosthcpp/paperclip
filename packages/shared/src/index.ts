@@ -599,6 +599,7 @@ export type {
   AgentEnvConfig,
   CompanySecret,
   CompanySecretProviderConfig,
+  OciVaultProviderConfig,
   SecretProviderConfigPayload,
   SecretProviderConfigHealthDetails,
   SecretProviderConfigHealthResponse,
