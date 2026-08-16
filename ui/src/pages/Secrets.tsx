@@ -97,6 +97,9 @@ type ProviderVaultForm = {
   address: string;
   mountPath: string;
   secretPathPrefix: string;
+  vaultOcid: string;
+  compartmentOcid: string;
+  secretOcidPrefix: string;
 };
 
 const PROVIDER_ORDER: SecretProvider[] = [
@@ -104,6 +107,7 @@ const PROVIDER_ORDER: SecretProvider[] = [
   "aws_secrets_manager",
   "gcp_secret_manager",
   "vault",
+  "oci_vault",
 ];
 
 function defaultProviderVaultStatus(provider: SecretProvider): SecretProviderConfigStatus {
@@ -128,6 +132,9 @@ function emptyProviderVaultForm(provider: SecretProvider = "local_encrypted"): P
     address: "",
     mountPath: "",
     secretPathPrefix: "",
+    vaultOcid: "",
+    compartmentOcid: "",
+    secretOcidPrefix: "",
   };
 }
 
@@ -156,6 +163,9 @@ function providerVaultFormFromConfig(config: CompanySecretProviderConfig): Provi
     address: providerConfigValue(config.config, "address"),
     mountPath: providerConfigValue(config.config, "mountPath"),
     secretPathPrefix: providerConfigValue(config.config, "secretPathPrefix"),
+    vaultOcid: providerConfigValue(config.config, "vaultOcid"),
+    compartmentOcid: providerConfigValue(config.config, "compartmentOcid"),
+    secretOcidPrefix: providerConfigValue(config.config, "secretOcidPrefix"),
   };
 }
 
@@ -322,6 +332,8 @@ function buildProviderVaultConfig(form: ProviderVaultForm): Record<string, unkno
         mountPath: compact(form.mountPath),
         secretPathPrefix: compact(form.secretPathPrefix),
       };
+    case "oci_vault":
+      return { region: form.region.trim(), vaultOcid: form.vaultOcid.trim(), compartmentOcid: compact(form.compartmentOcid), secretOcidPrefix: compact(form.secretOcidPrefix) };
     default:
       return {};
   }
@@ -1479,7 +1491,8 @@ export function Secrets() {
               disabled={
                 saveVaultMutation.isPending ||
                 !vaultForm.displayName.trim() ||
-                (vaultForm.provider === "aws_secrets_manager" && !vaultForm.region.trim())
+                ((vaultForm.provider === "aws_secrets_manager" || vaultForm.provider === "oci_vault") && !vaultForm.region.trim()) ||
+                (vaultForm.provider === "oci_vault" && !vaultForm.vaultOcid.trim())
               }
             >
               {saveVaultMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : null}
@@ -2123,6 +2136,15 @@ function ProviderVaultFields({
         <TextField label="Secret name prefix" value={form.secretNamePrefix} onChange={(value) => setField("secretNamePrefix", value)} placeholder="paperclip" />
       </div>
     );
+  }
+
+  if (form.provider === "oci_vault") {
+    return <div className="grid gap-3 sm:grid-cols-2">
+      <TextField label="OCI region" value={form.region} onChange={(value) => setField("region", value)} placeholder="ap-seoul-1" required />
+      <TextField label="Vault OCID" value={form.vaultOcid} onChange={(value) => setField("vaultOcid", value)} placeholder="ocid1.vault..." required />
+      <TextField label="Compartment OCID" value={form.compartmentOcid} onChange={(value) => setField("compartmentOcid", value)} placeholder="ocid1.compartment..." />
+      <TextField label="Secret OCID prefix" value={form.secretOcidPrefix} onChange={(value) => setField("secretOcidPrefix", value)} placeholder="ocid1.vaultsecret..." />
+    </div>;
   }
 
   return (

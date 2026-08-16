@@ -186,11 +186,19 @@ export const vaultProviderConfigSchema = z.object({
   secretPathPrefix: optionalSafeShortText,
 }).strict();
 
+export const ociVaultProviderConfigSchema = z.object({
+  region: z.string().trim().regex(/^[a-z]+(?:-[a-z]+)+-\d+$/, "Invalid OCI region"),
+  vaultOcid: z.string().trim().regex(/^ocid1\.vault\.[a-z0-9.-]+$/i, "Invalid OCI vault OCID"),
+  compartmentOcid: z.string().trim().regex(/^ocid1\.compartment\.[a-z0-9.-]+$/i, "Invalid OCI compartment OCID").optional().nullable(),
+  secretOcidPrefix: z.string().trim().regex(/^ocid1\.vaultsecret\.[a-z0-9.-]*$/i, "Invalid OCI secret OCID prefix").optional().nullable(),
+}).strict();
+
 export const secretProviderConfigPayloadSchema = z.discriminatedUnion("provider", [
   z.object({ provider: z.literal("local_encrypted"), config: localEncryptedProviderConfigSchema }),
   z.object({ provider: z.literal("aws_secrets_manager"), config: awsSecretsManagerProviderConfigSchema }),
   z.object({ provider: z.literal("gcp_secret_manager"), config: gcpSecretManagerProviderConfigSchema }),
   z.object({ provider: z.literal("vault"), config: vaultProviderConfigSchema }),
+  z.object({ provider: z.literal("oci_vault"), config: ociVaultProviderConfigSchema }),
 ]);
 
 export const createSecretProviderConfigSchema = z.object({
