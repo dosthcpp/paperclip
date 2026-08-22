@@ -607,6 +607,12 @@ function resolveManagedCodexHomeDir(companyId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "codex-home");
 }
 
+function isManagedCodexHomeDir(companyId: string, candidate: string): boolean {
+  const companyRoot = path.resolve(defaultPaperclipInstanceDir(), "companies", companyId);
+  const resolved = path.resolve(candidate);
+  return resolved === companyRoot || resolved.startsWith(`${companyRoot}${path.sep}`);
+}
+
 // Walk up from startDir looking for `node_modules/.bin/<binName>`. This matches
 // npm/pnpm binary hoisting in packaged installs while preserving monorepo dev.
 export async function findAncestorBin(startDir: string, binName: string): Promise<string | null> {
@@ -1039,13 +1045,17 @@ async function prepareCodexSkillRuntime(input: {
       ? path.resolve(process.env.CODEX_HOME.trim())
       : path.join(os.homedir(), ".codex");
   const managedCodexHome = resolveManagedCodexHomeDir(input.companyId);
-  const effectiveCodexHome = configuredCodexHome ??
+  const configuredHomeIsManaged =
+    configuredCodexHome != null && isManagedCodexHomeDir(input.companyId, configuredCodexHome);
+  const effectiveCodexHome = configuredCodexHome ?? managedCodexHome;
+  if (configuredCodexHome == null || configuredHomeIsManaged) {
     await prepareManagedCodexHome({
       companyId: input.companyId,
       sourceHome: sourceCodexHome,
-      targetHome: managedCodexHome,
+      targetHome: effectiveCodexHome,
       onLog: input.onLog,
     });
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");

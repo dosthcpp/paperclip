@@ -739,6 +739,49 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("repairs stale auth in a configured per-agent managed home before ACP execution", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-auth-repair-");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const sharedCodexHome = path.join(root, "shared-codex-home");
+    const managedAgentHome = path.join(
+      paperclipHome,
+      "instances",
+      "test",
+      "companies",
+      "company-1",
+      "agents",
+      "agent-1",
+      "codex-home",
+    );
+    const sharedAuth = path.join(sharedCodexHome, "auth.json");
+    const managedAuth = path.join(managedAgentHome, "auth.json");
+
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.CODEX_HOME = sharedCodexHome;
+    await fs.mkdir(sharedCodexHome, { recursive: true });
+    await fs.mkdir(managedAgentHome, { recursive: true });
+    await fs.writeFile(sharedAuth, subscriptionAuthJson("acct-live", NEWER_REFRESH, "live"), "utf8");
+    await fs.writeFile(managedAuth, subscriptionAuthJson("acct-stale", OLDER_REFRESH, "stale"), "utf8");
+
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+    const result = await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        env: { CODEX_HOME: managedAgentHome, OPENAI_API_KEY: "" },
+        promptTemplate: "Do the assigned work.",
+      },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect((await fs.lstat(managedAuth)).isSymbolicLink()).toBe(true);
+    expect(await fs.realpath(managedAuth)).toBe(await fs.realpath(sharedAuth));
+  });
+
   it("creates the ACP session on the in-sandbox workspace cwd for runner-backed remote runs", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-remote-cwd-");
     const localCwd = path.join(root, "worktree");
