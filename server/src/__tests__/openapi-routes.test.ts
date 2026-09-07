@@ -6,6 +6,10 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
+import {
+  ISSUE_COUNT_QUERY_PARAMS,
+  ISSUE_LIST_QUERY_PARAMS,
+} from "../http/issue-list-query-params.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -161,6 +165,17 @@ function loadActualRoutes() {
   return { routes, unknownRouteFiles: unknownRouteFiles.sort() };
 }
 
+function documentedQueryParams(spec: { paths?: Record<string, any> }, routePath: string) {
+  const parameters = (spec.paths?.[routePath]?.get?.parameters ?? []) as {
+    in: string;
+    name: string;
+  }[];
+  return parameters
+    .filter((parameter) => parameter.in === "query")
+    .map((parameter) => parameter.name)
+    .sort();
+}
+
 function loadSpecRoutes() {
   const spec = buildOpenApiSpec();
   const routes = new Set<string>();
@@ -282,6 +297,21 @@ describe("openapi routes", () => {
       missingInSpec: [],
       extraInSpec: [],
     });
+  });
+
+  it("documents the issue-list filter parameters the routes enforce", () => {
+    const { spec } = loadSpecRoutes();
+
+    // The routes reject unknown query parameters with 400, so the spec has to carry
+    // the whole supported set: an undocumented filter is now an unusable one.
+    expect(documentedQueryParams(spec, "/api/companies/{companyId}/issues")).toEqual(
+      [...ISSUE_LIST_QUERY_PARAMS].sort(),
+    );
+    expect(documentedQueryParams(spec, "/api/companies/{companyId}/issues/count")).toEqual(
+      [...ISSUE_COUNT_QUERY_PARAMS].sort(),
+    );
+    expect(spec.paths["/api/companies/{companyId}/issues"].get.responses["400"]).toBeDefined();
+    expect(spec.paths["/api/companies/{companyId}/issues/count"].get.responses["400"]).toBeDefined();
   });
 
   it("documents auth and reviewed response-code invariants", () => {

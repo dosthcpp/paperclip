@@ -246,6 +246,10 @@ import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
 } from "@paperclipai/shared/company-import-transfer";
+import {
+  ISSUE_COUNT_QUERY_PARAMS,
+  ISSUE_LIST_QUERY_PARAMS,
+} from "../http/issue-list-query-params.js";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -766,6 +770,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -783,6 +788,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
   });
@@ -2300,17 +2306,58 @@ registry.registerPath({
 
 // ─── Issues ──────────────────────────────────────────────────────────────────
 
+// Every issue-list filter is a string on the wire. These are the ones whose accepted
+// values are narrow enough to be worth spelling out; the rest document as free strings.
+const issueQueryParamSchemas: Record<string, z.ZodTypeAny> = {
+  assigneeAgentId: z
+    .string()
+    .describe("Agent id, or `null` for unassigned. Not `assigneeId` — that name is rejected with 400."),
+  assigneeUserId: z.string().describe("Board user id, or `me` for the authenticated board user."),
+  attention: z.enum(["blocked"]),
+  excludeRoutineExecutions: z.enum(["true", "1"]),
+  hasPlanDocument: z.enum(["true", "false"]),
+  includeBlockedBy: z.enum(["true", "1"]),
+  includeBlockedInboxAttention: z.enum(["true", "1"]),
+  includeLiveDescendantSummary: z.enum(["true", "false"]),
+  includePluginOperations: z.enum(["true", "1"]),
+  includeRoutineExecutions: z.enum(["true", "1"]),
+  sortDir: z.enum(["asc", "desc"]),
+  sortField: z.enum(["updated"]),
+  status: z.string().describe("One status, or a comma-separated list."),
+  updatedSince: z.string().describe("ISO 8601 timestamp."),
+  view: z.enum(["compact"]),
+};
+
+// Built from the same constant the route enforces, so a filter cannot be added to one
+// without the other. `openapi-routes.test.ts` asserts the two stay identical.
+function issueQuerySchema(params: readonly string[]) {
+  return z.object(
+    Object.fromEntries(
+      params.map((name) => [name, (issueQueryParamSchemas[name] ?? z.string()).optional()]),
+    ),
+  );
+}
+
 registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
-  description: "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+  description:
+    "Use `view=compact` for the board issue-list row contract. The default response remains the " +
+    "broad compatibility contract. The parameters below are the complete filter set: any other " +
+    "query parameter is rejected with 400 rather than dropped, because a dropped filter returns " +
+    "the unfiltered company list and the caller cannot tell it apart from a filtered one.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: issueQuerySchema(ISSUE_LIST_QUERY_PARAMS),
   },
-  responses: { 200: r.ok(), 304: { description: "Not Modified" }, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    304: { description: "Not Modified" },
+    400: r.badRequest,
+    401: r.unauthorized,
+  },
 });
 
 registry.registerPath({
@@ -7001,10 +7048,21 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/issues/count",
+  tags: ["companies"],
+  summary: "Count issues in a company",
+  description:
+    "Requires `attention=blocked` and accepts neither `limit` nor `offset`. The filter set is the " +
+    "issue-list one minus projection, ordering and per-user inbox filters; any other query " +
+    "parameter is rejected with 400.",
+  query: issueQuerySchema(ISSUE_COUNT_QUERY_PARAMS),
+});
+
 for (const route of [
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
-  ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
 ] as const) {
   registerCurrentRoute({
     method: route[0],
