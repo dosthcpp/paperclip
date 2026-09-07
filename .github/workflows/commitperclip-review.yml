@@ -36,11 +36,22 @@ jobs:
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          if [ -n "$COMMITPERCLIP_KEY" ]; then
+            TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          else
+            # Forks do not inherit COMMITPERCLIP_KEY. Hard-failing here skips
+            # every later step, so the quality gates never run at all — the
+            # check goes red for a missing secret rather than for code. Fall
+            # back to GITHUB_TOKEN, which carries the permissions block above
+            # and is enough for every gate; only the comment author changes.
+            echo "COMMITPERCLIP_KEY not set — running gates with GITHUB_TOKEN."
+            TOKEN=$FALLBACK_TOKEN
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run quality gates
         id: quality

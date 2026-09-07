@@ -30,6 +30,34 @@ test('findExistingComment: paginates until it finds the commitperclip comment', 
   ]);
 });
 
+test('findExistingComment: finds the fallback comment posted via GITHUB_TOKEN', async () => {
+  // Forks without COMMITPERCLIP_KEY post as github-actions[bot]. If the upsert
+  // cannot recognise that author it appends a new comment on every push.
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 42,
+      user: { login: 'github-actions[bot]' },
+      body: 'Hey @someone! Before this PR can be reviewed...\n\n— commitperclip',
+    },
+  ]), 'token', 'dosthcpp/paperclip', 13);
+
+  assert.equal(comment.id, 42);
+});
+
+test('findExistingComment: ignores unsigned github-actions[bot] comments', async () => {
+  // Widening the author set must not let the gate overwrite comments left by
+  // unrelated workflows running under the same bot identity.
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 7,
+      user: { login: 'github-actions[bot]' },
+      body: 'Deploy preview ready: https://example.invalid/preview',
+    },
+  ]), 'token', 'dosthcpp/paperclip', 13);
+
+  assert.equal(comment, null);
+});
+
 test('findExistingComment: returns null when no signed comment exists', async () => {
   const comment = await findExistingComment(async () => ([
     {

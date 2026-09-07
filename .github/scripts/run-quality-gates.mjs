@@ -21,6 +21,17 @@ import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors
 
 const COMMENT_SIGNATURE = '— commitperclip';
 
+// Authors whose signed comment counts as "the gate comment" and is updated in
+// place. Forks with no COMMITPERCLIP_KEY post as github-actions[bot]; leaving
+// that out means the upsert never recognises its own comment and appends a
+// fresh one on every push. The signature check still scopes this to gate
+// output, so an unrelated github-actions[bot] comment is never overwritten.
+const GATE_COMMENT_AUTHORS = new Set([
+  'commitperclip[bot]',
+  'commitperclip',
+  'github-actions[bot]',
+]);
+
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
     return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
@@ -57,8 +68,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      c => GATE_COMMENT_AUTHORS.has(c.user.login) && c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 
