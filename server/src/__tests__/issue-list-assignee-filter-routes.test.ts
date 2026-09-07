@@ -784,6 +784,164 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     });
   });
 
+  it("rejects assigneeId instead of answering with the unfiltered company list", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Caller",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Someone else",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // The caller owns nothing; every open card belongs to another agent. Dropping the
+    // filter used to return all of them as a plausible-looking "my todo cards" list.
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Not the caller's issue",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: otherAgentId,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Also not the caller's issue",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: otherAgentId,
+      },
+    ]);
+
+    const app = createApp(companyId);
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ assigneeId: agentId, status: "todo", limit: "100" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(Array.isArray(res.body)).toBe(false);
+    expect(res.body.error).toContain("assigneeId");
+    expect(res.body.error).toContain("assigneeAgentId");
+    expect(res.body.error).toContain("assigneeUserId");
+    expect(res.body.unsupportedParameters).toEqual(["assigneeId"]);
+    expect(res.body.supportedParameters).toContain("assigneeAgentId");
+  });
+
+  it("accepts every supported issue list filter together", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+
+    // Guards the other side of the fix: an allowlist that is too narrow would 400 a
+    // caller that is using the API correctly, including the board UI.
+    const app = createApp(companyId);
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({
+        attention: "blocked",
+        assigneeAgentId: randomUUID(),
+        assigneeUserId: "cloud-user-1",
+        participantAgentId: randomUUID(),
+        touchedByUserId: "cloud-user-1",
+        inboxArchivedByUserId: "cloud-user-1",
+        unreadForUserId: "cloud-user-1",
+        status: "todo",
+        projectId: randomUUID(),
+        workspaceId: randomUUID(),
+        executionWorkspaceId: randomUUID(),
+        parentId: randomUUID(),
+        parentIssueId: randomUUID(),
+        descendantOf: randomUUID(),
+        labelId: randomUUID(),
+        originKind: "routine_execution",
+        originKindPrefix: "routine",
+        originId: randomUUID(),
+        includeRoutineExecutions: "true",
+        excludeRoutineExecutions: "false",
+        includePluginOperations: "true",
+        includeBlockedBy: "true",
+        includeBlockedInboxAttention: "true",
+        includeLiveDescendantSummary: "false",
+        hasPlanDocument: "false",
+        updatedSince: new Date(0).toISOString(),
+        q: "anything",
+        limit: "20",
+        offset: "0",
+        sortField: "updated",
+        sortDir: "desc",
+        view: "compact",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("rejects unsupported query parameters on the issue count route", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+
+    const app = createApp(companyId);
+    const rejected = await request(app)
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked", assigneeId: randomUUID() });
+
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(400);
+    expect(rejected.body.unsupportedParameters).toEqual(["assigneeId"]);
+
+    // limit/offset stay in the count allowlist so their own message keeps answering.
+    const limited = await request(app)
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked", limit: "10" });
+
+    expect(limited.status).toBe(400);
+    expect(limited.body).toMatchObject({ error: "issues/count does not accept limit or offset" });
+
+    const accepted = await request(app)
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked", status: "todo", assigneeAgentId: randomUUID() });
+
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect(accepted.body).toMatchObject({ count: 0 });
+  });
+
   it("returns opt-in live descendant counts for offscreen live descendants only", async () => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();

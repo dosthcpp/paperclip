@@ -110,6 +110,12 @@ import {
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
+import {
+  ISSUE_COUNT_QUERY_PARAMS,
+  ISSUE_LIST_QUERY_PARAMS,
+  findUnsupportedIssueQueryParams,
+  unsupportedIssueQueryParamsError,
+} from "../http/issue-list-query-params.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -6491,6 +6497,14 @@ export function issueRoutes(
       res.status(403).json({ error: "Task bridge keys cannot use company-wide issue list APIs" });
       return;
     }
+    // Reject before any filtering happens: an ignored filter name returns the whole
+    // company list under the caller's intended-but-unapplied filter, and the caller
+    // cannot tell that from a correct answer.
+    const unsupportedListParams = findUnsupportedIssueQueryParams(req.query, ISSUE_LIST_QUERY_PARAMS);
+    if (unsupportedListParams.length > 0) {
+      res.status(400).json(unsupportedIssueQueryParamsError(unsupportedListParams, ISSUE_LIST_QUERY_PARAMS));
+      return;
+    }
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as string | undefined;
     const inboxArchivedByUserFilterRaw = req.query.inboxArchivedByUserId as string | undefined;
@@ -6781,6 +6795,11 @@ export function issueRoutes(
     assertCompanyAccess(req, companyId);
     if (isTaskBridgeKeyActor(req)) {
       res.status(403).json({ error: "Task bridge keys cannot use company-wide issue count APIs" });
+      return;
+    }
+    const unsupportedCountParams = findUnsupportedIssueQueryParams(req.query, ISSUE_COUNT_QUERY_PARAMS);
+    if (unsupportedCountParams.length > 0) {
+      res.status(400).json(unsupportedIssueQueryParamsError(unsupportedCountParams, ISSUE_COUNT_QUERY_PARAMS));
       return;
     }
     const attention = req.query.attention as string | undefined;

@@ -1245,6 +1245,13 @@ Terminal states: `done`, `cancelled`
 | ------ | ---------------------------------- | ---------------------------------------------------------------------------------------- |
 | GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments) |
 | GET    | `/api/issues/:issueId`             | Issue details + ancestors                                                                |
+
+> The issue list rejects unknown query parameters with `400`. The agent assignee filter is
+> **`assigneeAgentId`** — `assigneeId` is not accepted, because it is ambiguous between the agent
+> and the user assignee. Before this check existed the parameter was dropped and the endpoint
+> answered with the *unfiltered* company list, which is indistinguishable from a filtered one; see
+> `/api/openapi.json` for the full supported set.
+
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact context for heartbeat: issue state, ancestor summaries, comment cursor  |
 | GET    | `/api/issues/:issueId/diagnostics/blockers` | Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags |
 | GET    | `/api/issues/:issueId/diagnostics/wakes` | Read-only wake-history diagnostic with `diagnosis`, bounded events, and Case-B inference |
