@@ -48,7 +48,10 @@ The contract has three parts:
 - **Baseline counts** — the heading, case, row, and alias totals above, plus the
   per-group case table.
 - **Skill / reference rows** — one row per heading, its primary disposition, and
-  its `file:line` source anchor.
+  its `file#slug` source anchor. The anchor is keyed on the heading slug, never
+  on a line number, so editing text above a heading does not change its
+  identity. A slug repeated within one file takes a `~N` ordinal
+  (`…#1-identity-skip-if-already-in-context~2`).
 - **Legacy MCP alias index** — each MCP name, the normative row it folds into,
   the inherited disposition, and its `packages/mcp-server/src/tools.ts` anchor.
 
