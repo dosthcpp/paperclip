@@ -19,8 +19,19 @@ const outputPaths = {
 const checkOnly = process.argv.includes("--check");
 const dispositions = new Set(["control_plane_owned", "always_agent_tool", "optional_agent_tool"]);
 
-function sourceAnchor(path, line, heading) {
-  return `${path}#L${line}:${heading.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}`;
+// Rows are keyed on the heading slug, never on its line number: a line number in the
+// identity churns every row below an inserted line, so a one-line documentation edit
+// fails the drift gate with nothing semantic changed. Repeated slugs within one file
+// take a `~N` ordinal, which no slug can produce (`~` is outside the slug alphabet).
+function slug(heading) {
+  return heading.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+function headingKey(seenSlugs, heading) {
+  const base = slug(heading) || "heading";
+  const occurrence = (seenSlugs.get(base) ?? 0) + 1;
+  seenSlugs.set(base, occurrence);
+  return occurrence === 1 ? base : `${base}~${occurrence}`;
 }
 
 function classifyHeading(path, heading) {
@@ -51,15 +62,17 @@ async function readSkillHeadings(paths) {
   const rows = [];
   for (const path of paths) {
     const contents = await readFile(resolve(repositoryRoot, path), "utf8");
-    for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    const seenSlugs = new Map();
+    for (const line of contents.split(/\r?\n/)) {
       const match = /^(#{1,6})\s+(.+?)\s*#*$/.exec(line);
       if (!match) continue;
       const heading = match[2].trim();
+      const key = headingKey(seenSlugs, heading);
       const disposition = classifyHeading(path, heading);
       rows.push({
-        id: `skill:${path}:${index + 1}`,
+        id: `skill:${path}:${key}`,
         kind: "skill_heading",
-        sourceAnchor: sourceAnchor(path, index + 1, heading),
+        sourceAnchor: `${path}#${key}`,
         heading,
         primaryDisposition: disposition,
         semanticOperation: semanticOperation(disposition, heading),
@@ -75,7 +88,7 @@ async function readLegacyTools() {
   const contents = await readFile(resolve(repositoryRoot, path), "utf8");
   return [...contents.matchAll(/makeTool\(\s*\n?\s*"(paperclip[A-Za-z0-9]+)"/g)].map((match) => ({
     name: match[1],
-    sourceAnchor: sourceAnchor(path, contents.slice(0, match.index).split("\n").length, match[1]),
+    sourceAnchor: `${path}#${match[1]}`,
   }));
 }
 
@@ -199,7 +212,9 @@ export async function main() {
   const output = await buildContract();
   for (const [path, contents] of Object.entries(output)) {
     if (checkOnly) {
-      if (!existsSync(path) || await readFile(path, "utf8") !== contents) throw new Error(`Generated contract drift: ${relative(packageRoot, path)}`);
+      if (!existsSync(path) || await readFile(path, "utf8") !== contents) {
+        throw new Error(`Generated contract drift: ${relative(packageRoot, path)}\nFix: run \`pnpm --dir packages/paperclip-runner generate:capability-contract\` and commit the regenerated files.\nEditing anything under skills/ also requires \`generate:capability-inventory\`, which is checked by the next step in this build.`);
+      }
     } else {
       await writeFile(path, contents);
     }
