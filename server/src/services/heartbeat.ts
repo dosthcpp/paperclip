@@ -12849,6 +12849,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         details: Record<string, unknown>;
       };
 
+  /**
+   * When the most recent wake signal behind a queued run was raised.
+   *
+   * Wakes that coalesce onto an already-queued run insert their own wakeup
+   * request pointing at the same run, so the newest `requestedAt` — not the
+   * run's `createdAt` — is what dates the intent the run is carrying.
+   */
+  async function resolveLatestWakeSignalAt(
+    run: typeof heartbeatRuns.$inferSelect,
+    dbOrTx: Db = db,
+  ): Promise<Date | null> {
+    const latest = await dbOrTx
+      .select({ requestedAt: agentWakeupRequests.requestedAt })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.runId, run.id),
+        ),
+      )
+      .orderBy(desc(agentWakeupRequests.requestedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    const requestedAt = latest?.requestedAt ? new Date(latest.requestedAt) : null;
+    const createdAt = run.createdAt ? new Date(run.createdAt) : null;
+    if (!requestedAt) return createdAt;
+    if (!createdAt) return requestedAt;
+    return requestedAt.getTime() >= createdAt.getTime() ? requestedAt : createdAt;
+  }
+
   async function evaluateQueuedRunStaleness(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
@@ -12861,6 +12892,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         executionRunId: issues.executionRunId,
         executionState: issues.executionState,
+        completedAt: issues.completedAt,
+        cancelledAt: issues.cancelledAt,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -12957,12 +12990,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.status === "done" || issue.status === "cancelled") {
-      if (!resumeIntent && !wakeCommentId) {
+      // A resume request or an issue comment is the sanctioned way to pick work
+      // back up on a terminal issue, but the intent has to be newer than the
+      // terminal transition itself. A wake that was already queued when the
+      // issue was closed carries no intent to reopen it: the close is the more
+      // recent decision and supersedes it. Without this, an ordinary follow-up
+      // comment or resume on a live issue keeps the guard permanently open once
+      // the issue is cancelled a moment later, and the run still starts and burns
+      // a full agent heartbeat on terminal work (TON-5027).
+      const terminalAt =
+        issue.status === "cancelled" ? issue.cancelledAt : issue.completedAt;
+      const bypassSignalAt = await resolveLatestWakeSignalAt(run, dbOrTx);
+      // Rows closed before the terminal timestamps existed keep the old
+      // behaviour rather than cancelling a resume we cannot date.
+      const bypassPredatesTerminalTransition =
+        terminalAt !== null &&
+        (bypassSignalAt === null ||
+          bypassSignalAt.getTime() <= new Date(terminalAt).getTime());
+
+      if ((!resumeIntent && !wakeCommentId) || bypassPredatesTerminalTransition) {
         return {
           stale: true,
           errorCode: "issue_terminal_status",
           reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
-          details: { issueId, currentStatus: issue.status },
+          details: {
+            issueId,
+            currentStatus: issue.status,
+            terminalAt: terminalAt ? new Date(terminalAt).toISOString() : null,
+            wakeSignalAt: bypassSignalAt ? bypassSignalAt.toISOString() : null,
+            resumeIntent,
+            wakeCommentId,
+          },
         };
       }
     }
