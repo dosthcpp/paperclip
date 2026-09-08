@@ -2935,6 +2935,94 @@ function reviewAttentionNone(): IssueReviewAttention {
   return { state: "none", paths: [], reason: null };
 }
 
+type IssueReviewTransitionPathContext = {
+  issueId: string;
+  actorType: string;
+  actorId: string;
+  runId: string | null;
+  reviewInteractionId: string | null;
+  createdAt: Date;
+};
+
+async function listIssueReviewTransitionPathContextMap(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, IssueReviewTransitionPathContext>> {
+  const result = new Map<string, IssueReviewTransitionPathContext>();
+  for (const chunk of chunkList(issueIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const rows = await dbOrTx
+      .selectDistinctOn([activityLog.entityId], {
+        issueId: activityLog.entityId,
+        actorType: activityLog.actorType,
+        actorId: activityLog.actorId,
+        runId: activityLog.runId,
+        details: activityLog.details,
+        createdAt: activityLog.createdAt,
+      })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.action, "issue.updated"),
+        inArray(activityLog.entityId, chunk),
+        sql`(
+          (
+            ${activityLog.details} ->> 'status' = 'in_review'
+            AND ${activityLog.details} -> '_previous' ->> 'status' IS NOT NULL
+            AND ${activityLog.details} -> '_previous' ->> 'status' <> 'in_review'
+          )
+          OR
+          (
+            ${activityLog.details} -> 'changes' -> 'status' ->> 'to' = 'in_review'
+            AND ${activityLog.details} -> 'changes' -> 'status' ->> 'from' IS NOT NULL
+            AND ${activityLog.details} -> 'changes' -> 'status' ->> 'from' <> 'in_review'
+          )
+        )`,
+      ))
+      .orderBy(activityLog.entityId, desc(activityLog.createdAt), desc(activityLog.id));
+
+    for (const row of rows as Array<{
+      issueId: string;
+      actorType: string;
+      actorId: string;
+      runId: string | null;
+      details: Record<string, unknown> | null;
+      createdAt: Date;
+    }>) {
+      result.set(row.issueId, {
+        issueId: row.issueId,
+        actorType: row.actorType,
+        actorId: row.actorId,
+        runId: row.runId,
+        reviewInteractionId: typeof row.details?.reviewInteractionId === "string"
+          ? row.details.reviewInteractionId
+          : null,
+        createdAt: row.createdAt,
+      });
+    }
+  }
+  return result;
+}
+
+function interactionMaintainsCurrentReviewPath(
+  interaction: {
+    id: string;
+    createdByAgentId: string | null;
+    sourceRunId: string | null;
+    createdAt: Date;
+  },
+  transition: IssueReviewTransitionPathContext | undefined,
+) {
+  if (!transition) return true;
+  if (transition.reviewInteractionId === interaction.id) return true;
+  if (interaction.createdAt.getTime() >= transition.createdAt.getTime()) return true;
+  return transition.actorType === "agent"
+    && transition.actorId === interaction.createdByAgentId
+    && transition.runId !== null
+    && transition.runId === interaction.sourceRunId;
+}
+
 async function listIssueReviewAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -2957,7 +3045,16 @@ async function listIssueReviewAttentionMap(
   }
   if (reviewIssues.length === 0) return result;
 
-  const [agentRows, activeRunRows, wakeRows, interactionRows, approvalRows, recoveryActionRows, recoveryIssueRows] = await Promise.all([
+  const [
+    agentRows,
+    activeRunRows,
+    wakeRows,
+    interactionRows,
+    approvalRows,
+    recoveryActionRows,
+    recoveryIssueRows,
+    reviewTransitionByIssueId,
+  ] = await Promise.all([
     dbOrTx
       .select({
         id: agents.id,
@@ -3077,7 +3174,25 @@ async function listIssueReviewAttentionMap(
         visibleIssueCondition(),
         notInArray(issues.status, ["done", "cancelled"]),
       )),
+    listIssueReviewTransitionPathContextMap(dbOrTx, companyId, reviewIds),
   ]);
+
+  const currentInteractionRows = (interactionRows as Array<{
+    id: string;
+    companyId: string;
+    issueId: string;
+    status: string;
+    kind: string;
+    createdByAgentId: string | null;
+    sourceRunId: string | null;
+    addresseeAgentId: string | null;
+    effectiveResolverPolicy: string;
+    resolverPolicyProvenance: string | null;
+    createdAt: Date;
+  }>).filter((interaction) => interactionMaintainsCurrentReviewPath(
+    interaction,
+    reviewTransitionByIssueId.get(interaction.issueId),
+  ));
 
   const recoveryPaths = [
     ...(recoveryActionRows as Array<{ id: string; companyId: string; issueId: string; status: string; createdAt: Date }>),
@@ -3123,7 +3238,7 @@ async function listIssueReviewAttentionMap(
     agents: agentRows,
     activeRuns: activeRunRows,
     queuedWakeRequests: wakeRows,
-    pendingInteractions: interactionRows,
+    pendingInteractions: currentInteractionRows,
     pendingApprovals: approvalRows,
     openRecoveryIssues: recoveryPaths,
     now: new Date(),
@@ -3145,8 +3260,8 @@ async function listIssueReviewAttentionMap(
     ? await dbOrTx.select({ id: authUsers.id, name: authUsers.name }).from(authUsers).where(inArray(authUsers.id, [...userIds]))
     : [];
   const userNameById = new Map((userRows as Array<{ id: string; name: string }>).map((user) => [user.id, user.name]));
-  const interactionKindById = new Map((interactionRows as Array<{ id: string; kind: string }>).map((row) => [row.id, row.kind]));
-  const interactionAudienceById = new Map((interactionRows as Array<{
+  const interactionKindById = new Map(currentInteractionRows.map((row) => [row.id, row.kind]));
+  const interactionAudienceById = new Map((currentInteractionRows as Array<{
     id: string;
     createdByAgentId: string | null;
     sourceRunId: string | null;

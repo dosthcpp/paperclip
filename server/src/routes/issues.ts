@@ -3720,7 +3720,13 @@ export function issueRoutes(
       executionPolicy: nextExecutionPolicy,
     })) return null;
 
-    if (pendingInteractions.length > 0) return null;
+    const currentRunInteraction = pendingInteractions.find((interaction) =>
+      interaction.createdByAgentId === input.actorAgentId
+      && input.actorRunId !== null
+      && input.actorRunId !== undefined
+      && interaction.sourceRunId === input.actorRunId
+    );
+    if (currentRunInteraction) return null;
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return null;

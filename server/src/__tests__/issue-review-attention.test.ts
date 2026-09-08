@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests,
   agents,
+  activityLog,
   approvals,
   companies,
   createDb,
@@ -39,6 +40,7 @@ describeEmbeddedPostgres("issue review attention", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -235,6 +237,98 @@ describeEmbeddedPostgres("issue review attention", () => {
     expect(byId.get(humanOnlyInteractionIssueId)?.paths).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "interaction", responder: "Board" }),
     ]));
+  });
+
+  it("ignores a historical Board card while preserving the Board card bound to the current review", async () => {
+    const { companyId, agentId } = await seed();
+    const staleIssueId = await insertReview({ companyId, agentId, identifier: "RVA-9" });
+    const currentIssueId = await insertReview({ companyId, agentId, identifier: "RVA-10" });
+    const historicalInteractionId = randomUUID();
+    const currentInteractionId = randomUUID();
+    const historicalAt = new Date("2026-09-08T05:38:18.000Z");
+    const reviewTransitionAt = new Date("2026-09-08T14:57:13.000Z");
+
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: historicalInteractionId,
+        companyId,
+        issueId: staleIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        payload: { version: 1, prompt: "Review an earlier execution result?" },
+        createdAt: historicalAt,
+        updatedAt: historicalAt,
+      },
+      {
+        id: currentInteractionId,
+        companyId,
+        issueId: currentIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        payload: { version: 1, prompt: "Review the current execution result?" },
+        createdAt: historicalAt,
+        updatedAt: historicalAt,
+      },
+    ]);
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: staleIssueId,
+        details: {
+          status: "in_review",
+          changes: { status: { from: "in_progress", to: "in_review" } },
+          _previous: { status: "in_progress" },
+        },
+        createdAt: reviewTransitionAt,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: currentIssueId,
+        details: {
+          status: "in_review",
+          reviewInteractionId: currentInteractionId,
+          changes: { status: { from: "in_progress", to: "in_review" } },
+          _previous: { status: "in_progress" },
+        },
+        createdAt: reviewTransitionAt,
+      },
+    ]);
+
+    const rows = await svc.list(companyId, { status: "in_review" });
+    const byId = new Map(rows.map((row) => [row.id, row.reviewAttention]));
+
+    expect(byId.get(staleIssueId)).toMatchObject({
+      state: "stalled",
+      paths: [],
+    });
+    expect(byId.get(currentIssueId)).toMatchObject({
+      state: "covered",
+      paths: [expect.objectContaining({
+        kind: "interaction",
+        ref: currentInteractionId,
+        responder: "Board",
+      })],
+    });
   });
 
   it("does not let a transiently skipped recovery consume its fingerprint", async () => {
