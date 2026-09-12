@@ -105,21 +105,34 @@ function classifySkillHeading(heading) {
   return "optional_agent_tool";
 }
 
+// Rows are keyed on the heading slug, never on its line number: a line number in the
+// identity churns every row below an inserted line, so a one-line documentation edit
+// fails the drift gate with nothing semantic changed. Repeated slugs within one file
+// take a `~N` ordinal, which no slug can produce (`~` is outside the slug alphabet).
+function headingKey(seenSlugs, title) {
+  const base = slug(title) || "heading";
+  const occurrence = (seenSlugs.get(base) ?? 0) + 1;
+  seenSlugs.set(base, occurrence);
+  return occurrence === 1 ? base : `${base}~${occurrence}`;
+}
+
 function parseSkillHeadings(text, file) {
-  return text.split("\n").flatMap((line, index) => {
+  const seenSlugs = new Map();
+  return text.split("\n").flatMap((line) => {
     const match = /^(#{1,4})\s+(.+?)\s*$/.exec(line);
     if (!match) return [];
     const title = match[2];
+    const key = headingKey(seenSlugs, title);
     return [{
-      id: `skill:${file}:${slug(title) || "heading"}:${index + 1}`,
+      id: `skill:${file}:${key}`,
       sourceKind: "skill_heading",
-      sourceAnchor: `${file}:${index + 1}`,
+      sourceAnchor: `${file}#${key}`,
       title,
       expectedSemantics: `Skill guidance headed “${title}”.`,
       primaryDisposition: classifySkillHeading(title),
       requiredGrants: [],
       assertionClasses: ["control_plane_invariant"],
-      evidenceIds: [`skill:${file}:${index + 1}`],
+      evidenceIds: [`skill:${file}:${key}`],
     }];
   });
 }
@@ -166,7 +179,7 @@ function parseMcpTools(source) {
       name,
       description,
       sourceKind: "legacy_mcp_alias",
-      sourceAnchor: `packages/mcp-server/src/tools.ts:${source.slice(0, match.index).split("\n").length}`,
+      sourceAnchor: `packages/mcp-server/src/tools.ts#${name}`,
       expectedSemantics: description,
       foldedInto,
       evidenceId: `mcp:${name}`,

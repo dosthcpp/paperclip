@@ -51,7 +51,13 @@ for (const [path, source] of Object.entries(expected)) {
   if (await readFile(path, "utf8").catch(() => "") !== source) errors.push(`Generated output is stale: ${path}.`);
 }
 if (errors.length > 0) {
-  process.stderr.write(`Capability inventory check failed:\n${errors.map((error) => `- ${error}`).join("\n")}\n`);
+  process.stderr.write([
+    "Capability inventory check failed:",
+    ...errors.map((error) => `- ${error}`),
+    "Fix: stale/missing source rows and stale generated output are cleared by `pnpm --dir packages/paperclip-runner generate:capability-inventory` (commit the regenerated spec/, docs/ and src/generated/ files).",
+    "That generator reads the paperclip-evals corpus; set PAPERCLIP_EVALS_ROOT if it is not a sibling of this repository.",
+    "",
+  ].join("\n"));
   process.exitCode = 1;
 } else {
   process.stdout.write("Capability inventory completeness and generated-output checks passed.\n");

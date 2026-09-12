@@ -16,7 +16,7 @@ Only two sources are normative:
 2. The Paperclip Evals corpus, contributing **106 cases across 16 groups**.
 
 Together these produce **258 normative rows**. The legacy Paperclip MCP tool
-surface (**41 tools**) is not a production capability surface; each MCP name is
+surface (**42 tools**) is not a production capability surface; each MCP name is
 folded one-to-one into a normative eval row as a traceability alias and inherits
 that row's disposition. The contract prints the alias index only so the
 normative target is easy to audit.
@@ -48,7 +48,10 @@ The contract has three parts:
 - **Baseline counts** — the heading, case, row, and alias totals above, plus the
   per-group case table.
 - **Skill / reference rows** — one row per heading, its primary disposition, and
-  its `file:line` source anchor.
+  its `file#slug` source anchor. The anchor is keyed on the heading slug, never
+  on a line number, so editing text above a heading does not change its
+  identity. A slug repeated within one file takes a `~N` ordinal
+  (`…#1-identity-skip-if-already-in-context~2`).
 - **Legacy MCP alias index** — each MCP name, the normative row it folds into,
   the inherited disposition, and its `packages/mcp-server/src/tools.ts` anchor.
 

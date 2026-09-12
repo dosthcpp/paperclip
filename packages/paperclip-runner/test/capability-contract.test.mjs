@@ -17,7 +17,10 @@ test("generated Capability inventory has full source coverage", async () => {
     readRows("eval-traceability.yaml"),
   ]);
 
-  assert.equal(capabilities.length, 152);
+  // 153, not 152: this contract matches `#{1,6}` while the spec/ inventory matches
+  // `#{1,4}`, and api-reference.md carries one H5. The two goldens are not row-for-row
+  // interchangeable — see docs/capability-contract.md for the inventory's own count.
+  assert.equal(capabilities.length, 153);
   assert.equal(tools.length, 42);
   assert.equal(evals.length, 106);
   assert.equal(new Set(evals.map((row) => row.group)).size, 16);
